@@ -316,7 +316,7 @@ class DeepEPBuffer:
                     hidden_size,
                     group.size(),
                     num_experts,
-                    num_topk=num_topk
+                    num_topk=num_topk,
                 ),
                 num_rdma_bytes,
             )
@@ -604,7 +604,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if use_groupgemm:
+        if self.quant_config.get("preserve_input_dtype", False):
+            # Opted-in BF16 drafts must not inherit the target's INT8/FP8
+            # activation quantization from process-wide flags.
+            pass
+        elif use_groupgemm:
             if _use_fp8_w8a8_moe:
                 hidden_states = per_token_quant_fp8(hidden_states)
             elif _use_marlin_w16a16_moe:
@@ -709,6 +713,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                         )
                         or _use_fp8_w8a8_moe
                         or _use_marlin_w16a16_moe
+                        or self.quant_config.get("preserve_input_dtype", False)
                     )
                     else 1
                 ),
@@ -918,7 +923,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         if use_groupgemm:
-            if _use_fp8_w8a8_moe:
+            preserve_input_dtype = self.quant_config.get("preserve_input_dtype", False)
+            if _use_fp8_w8a8_moe and not preserve_input_dtype:
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,
@@ -932,7 +938,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         return_recv_hook=self.return_recv_hook,
                     )
                 )
-            elif _use_marlin_w16a16_moe or _use_marlin_w4a16_moe:
+            elif (
+                preserve_input_dtype or _use_marlin_w16a16_moe or _use_marlin_w4a16_moe
+            ):
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
                         hidden_states,

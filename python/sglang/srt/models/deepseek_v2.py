@@ -664,7 +664,12 @@ class DeepseekV2MoE(nn.Module):
 
         self.config = config
         self.layer_id = layer_id
-        self.alt_stream = alt_stream
+        # HCU's automatic CP stream must not implicitly enable MoE overlap.
+        self.alt_stream = (
+            None
+            if _is_hcu and not envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+            else alt_stream
+        )
         self.is_nextn = is_nextn
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
@@ -1083,6 +1088,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             not _is_cuda
             and not _is_musa
+            and not _is_hcu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
@@ -2717,15 +2723,19 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # HCU defaults on: shared-expert / DeepEP overlap and DSA indexer CP
-        # gather overlap both need an alt stream. Keep the ROCm env as an
-        # explicit override for non-HCU HIP.
+        # Automatically enable HCU overlap only for DSA prefill CP. MoE
+        # overlap remains opt-in via SGLANG_ROCM_USE_MULTI_STREAM.
         self.alt_stream = (
             torch.cuda.Stream()
             if (
                 _is_cuda
                 or _is_musa
-                or _is_hcu
+                or (
+                    _is_hcu
+                    and self.use_dsa
+                    and self.dsa_enable_prefill_cp
+                    and self.cp_size > 1
+                )
                 or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
                 or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
             )
