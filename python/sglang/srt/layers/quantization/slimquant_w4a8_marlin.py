@@ -14,6 +14,7 @@
 
 import logging
 import os
+from copy import copy
 from typing import Dict, List, Optional
 
 import torch
@@ -43,6 +44,12 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+    CompressedTensorsW8A8Int8MarlinMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
@@ -505,6 +512,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         ignore: Optional[list[str]] = None,
         experts_only_linear: bool = False,
         compressed_tensors_packed: bool = False,
+        mixed_quant_config: Optional[CompressedTensorsConfig] = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -512,6 +520,9 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         # DeepSeek / Kimi still quantize dense Linear unless listed in ignore.
         self.experts_only_linear = experts_only_linear
         self.compressed_tensors_packed = compressed_tensors_packed
+        self.mixed_quant_config = mixed_quant_config
+        if mixed_quant_config is not None:
+            self.packed_modules_mapping = mixed_quant_config.packed_modules_mapping
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -533,10 +544,17 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, any]) -> "SlimQuantW4A8Int8MarlinConfig":
         archs = _hf_architectures(config.get("hf_config"))
         experts_only_linear = any(arch in _QWEN4_EXP_ARCHS for arch in archs)
+        mixed_quant_config = None
+        if config.get("quant_method") == "compressed-tensors" and any(
+            (group.get("weights") or {}).get("num_bits") == 8
+            for group in config.get("config_groups", {}).values()
+        ):
+            mixed_quant_config = CompressedTensorsConfig.from_config(config)
         return cls(
             ignore=config.get("ignore"),
             experts_only_linear=experts_only_linear,
             compressed_tensors_packed=config.get("format") == "pack-quantized",
+            mixed_quant_config=mixed_quant_config,
         )
 
     @classmethod
@@ -551,7 +569,7 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                 weight = group.get("weights") or {}
                 activation = group.get("input_activations") or {}
                 if not (
-                    weight.get("num_bits") == 4
+                    weight.get("num_bits") in (4, 8)
                     and weight.get("type") == "int"
                     and weight.get("strategy") == "channel"
                     and weight.get("symmetric") is True
@@ -563,7 +581,10 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                     and activation.get("dynamic") is True
                 ):
                     return None
-            if groups:
+            if any(
+                (group.get("weights") or {}).get("num_bits") == 4
+                for group in groups.values()
+            ):
                 return cls.get_name()
         if hf_quant_cfg.get("quant_method") == "slimquant_w4a8" and user_quant in (
             "slimquant_w4a8_marlin",
@@ -571,6 +592,21 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         ):
             return cls.get_name()
         return None
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        super().update_packed_modules_mapping(mapping)
+        if self.mixed_quant_config is not None:
+            self.mixed_quant_config.update_packed_modules_mapping(mapping)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper) -> None:
+        if self.mixed_quant_config is not None:
+            self.mixed_quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+            self.ignore = self.mixed_quant_config.ignore
+
+    def can_fuse_shared_expert(self) -> bool:
+        # Mixed CT checkpoints can keep shared experts at INT8 while routed
+        # experts are INT4. Keep their weights separate.
+        return self.mixed_quant_config is None
 
     def get_quant_method(
         self,
@@ -583,6 +619,14 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
+            if self.mixed_quant_config is not None:
+                scheme = self.mixed_quant_config.get_scheme_dict(layer, prefix)
+                if scheme is None:
+                    return UnquantizedLinearMethod()
+                if scheme["weights"].num_bits != 8:
+                    raise NotImplementedError(
+                        f"SlimQuant W4A8 requires INT8 Linear weights: {prefix}"
+                    )
             # Kimi-K3 INT4 (from mxfp4_to_int4.py) only quantizes the routed
             # experts; dense layers stay in BF16 and are listed in the
             # checkpoint's ignore list (native compressed-tensors style, with
@@ -602,6 +646,25 @@ class SlimQuantW4A8Int8MarlinConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return SlimQuantW4A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if self.mixed_quant_config is not None:
+                mixed_config = self.mixed_quant_config
+                mixed_config._add_fused_moe_to_target_scheme_map()
+                schemes = [
+                    mixed_config.get_scheme_dict(layer, f"{prefix}.0.{proj}")
+                    for proj in ("gate_proj", "up_proj", "down_proj")
+                ]
+                scheme = schemes[0]
+                if scheme is None or any(s != scheme for s in schemes[1:]):
+                    raise NotImplementedError(
+                        "SlimQuant mixed MoE requires matching quantized "
+                        f"gate/up/down projections: {prefix}"
+                    )
+                if scheme["weights"].num_bits == 8:
+                    # The existing W8A8 Marlin method reads its layer scheme
+                    # from the Linear target; do not mutate the shared config.
+                    layer_config = copy(mixed_config)
+                    layer_config.target_scheme_map = {"Linear": scheme}
+                    return CompressedTensorsW8A8Int8MarlinMoEMethod(layer_config)
             if get_moe_a2a_backend().is_megamoe():
                 return SlimQuantW4A8Int8MarlinMoEMethod(self)
             dspark_backend_override = get_dspark_w4a8_tpmoe_backend_override()

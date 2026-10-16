@@ -19,9 +19,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     build_m_indices_triton,
@@ -78,6 +75,9 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_marlin import (
     SlimQuantCompressedTensorsMarlinConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe_marlin import (
+    CompressedTensorsW8A8Int8MarlinMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
@@ -124,15 +124,17 @@ from deepgemm import (
     m_grouped_w4a8_gemm_nt_masked,
     m_grouped_w4a8_gemm_nt_masked_hipc,
 )
+
 try:
     from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
 except ImportError:
     m_grouped_w4a8_gemm_nt_contiguous_hipc = None
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
-from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
-from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
+from lightop import fuse_silu_mul_clamp_quant
+from lightop import fuse_situ_mul_quant_contiguous as fuse_situ_mul_quant
 from lightop import fuse_situ_mul_quant_ep
+from lightop import moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -140,7 +142,6 @@ from lightop.activation import (
     fuse_silu_mul_quant,
     fuse_silu_mul_quant_ep,
 )
-
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -150,9 +151,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
-_use_w4a8_contiguous_hipc = get_bool_env_var(
-    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC"
-)
+_use_w4a8_contiguous_hipc = get_bool_env_var("SGLANG_USE_W4A8_CONTIGUOUS_HIPC")
 _use_w4a8_masked_hipc = get_bool_env_var("SGLANG_USE_W4A8_MASKED_HIPC")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
@@ -481,21 +480,21 @@ def fuse_silu_mul_quant_ep_fake(
     scales = torch.empty((E, T, 1), device=input.device, dtype=torch.float32)
     return output, scales
 
+
 def fuse_situ_mul_quant_ep_fake(
     input: torch.Tensor,
     masked_m: torch.Tensor,
     situ_beta: float,
     situ_linear_beta: float,
-    expect_m: int = -1
+    expect_m: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     experts, tokens, doubled_hidden = input.shape
     output = torch.empty(
         (experts, tokens, doubled_hidden // 2), dtype=torch.int8, device=input.device
     )
-    scales = torch.empty(
-        (experts, tokens, 1), dtype=torch.float32, device=input.device
-    )
+    scales = torch.empty((experts, tokens, 1), dtype=torch.float32, device=input.device)
     return output, scales
+
 
 direct_register_custom_op(
     op_name="m_grouped_w4a8_gemm_nt_masked",
@@ -663,7 +662,9 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
-        elif isinstance(quant_config, SlimQuantW4A8Int8MarlinConfig):
+        elif isinstance(quant_config, SlimQuantW4A8Int8MarlinConfig) and not isinstance(
+            self.quant_method, CompressedTensorsW8A8Int8MarlinMoEMethod
+        ):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
                 self.quant_method.quant_config.weight_block_size
@@ -676,7 +677,9 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = True
             self.use_w8a8_marlin = False
             self.use_bf16_marlin = False
-        elif isinstance(quant_config, SlimQuantCompressedTensorsMarlinConfig):
+        elif isinstance(
+            quant_config, SlimQuantCompressedTensorsMarlinConfig
+        ) or isinstance(self.quant_method, CompressedTensorsW8A8Int8MarlinMoEMethod):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.block_shape = (
                 self.quant_method.quant_config.weight_block_size
@@ -1113,9 +1116,7 @@ class DeepEPMoE(FusedMoE):
             else:
                 # Apply the model-declared SwiGLU clamp when present. Models
                 # without swiglu_limit retain the original unclamped path.
-                swiglu_limit = getattr(
-                    self.moe_runner_config, "swiglu_limit", None
-                )
+                swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
                 if swiglu_limit is None:
                     q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
                 else:
@@ -2002,9 +2003,7 @@ class DeepEPMoE(FusedMoE):
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
             self, "down_gemm_overlap_args", None
         )
-        meta_overlap_args: Optional[dict] = getattr(
-            self, "meta_overlap_args", None
-        )
+        meta_overlap_args: Optional[dict] = getattr(self, "meta_overlap_args", None)
         assert self.moe_runner_config.activation == "silu"
         # base shapes
         num_groups, m, k = hidden_states.size()
