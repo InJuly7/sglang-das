@@ -26,6 +26,8 @@ class MonitorConfig:
     duration: float = 60.0
     delay: float = 0.0
     output_dir: str = "expert_distribution"
+    dump_gemm: bool = False
+    gemm_max_steps: int = 1
 
     @classmethod
     def from_env(cls):
@@ -44,11 +46,24 @@ class MonitorConfig:
             raise ValueError(
                 "SGLANG_EXPERT_DIST_DELAY_SEC must be finite and nonnegative"
             )
+        dump_gemm = os.environ.get("SGLANG_EXPERT_DIST_DUMP_GEMM", "0").lower()
+        if dump_gemm not in ("0", "1", "false", "true"):
+            raise ValueError("SGLANG_EXPERT_DIST_DUMP_GEMM must be 0 or 1")
+        dump_gemm = dump_gemm in ("1", "true")
+        max_steps = (
+            int(os.environ.get("SGLANG_EXPERT_DIST_GEMM_MAX_STEPS", "1"))
+            if dump_gemm
+            else 1
+        )
+        if max_steps <= 0:
+            raise ValueError("SGLANG_EXPERT_DIST_GEMM_MAX_STEPS must be positive")
         return cls(
             True,
             duration,
             delay,
             os.environ.get("SGLANG_EXPERT_DIST_OUTPUT_DIR", "expert_distribution"),
+            dump_gemm,
+            max_steps,
         )
 
 
@@ -95,6 +110,69 @@ class ExpertDistributionMonitor:
             dtype=torch.int64,
             device=device,
         )
+
+        self.gemm_records = []
+        self.gemm_variants = []
+        self._gemm_variant_lookup = {}
+        self.gemm_sample_steps = 0
+        self.gemm_inputs_file = None
+        self.gemm_vs_dispatch_match = None
+        if config.dump_gemm:
+            self.gemm_counts = torch.zeros(
+                (shape[0], 2, shape[1]), dtype=torch.int64, device=device
+            )
+            self.gemm_total = torch.zeros_like(self.gemm_counts)
+            self.gemm_tags = torch.full(
+                (shape[0], 2), -1, dtype=torch.int64, device=device
+            )
+
+    def on_gemm(self, api, layer, stage, a0, a1, b0, b1, output, masked_m, expected_m):
+        if not self.config.dump_gemm or self.disabled:
+            return
+        from sglang.srt.observability.gemm_input_dump import masked_gemm_metadata
+
+        if layer < 0 or stage not in ("gate_up", "down"):
+            raise ValueError("GEMM dump requires explicit layer and stage")
+        metadata = masked_gemm_metadata(
+            api, layer, stage, a0, a1, b0, b1, output, masked_m, expected_m
+        )
+        key = json.dumps(metadata, sort_keys=True)
+        variant = self._gemm_variant_lookup.get(key)
+        if variant is None:
+            variant = len(self.gemm_variants)
+            self._gemm_variant_lookup[key] = variant
+            self.gemm_variants.append(metadata)
+        stage_index = 0 if stage == "gate_up" else 1
+        # Captured GPU writes select the ACTUALLY REPLAYED variant. Never read
+        # masked_m on the CPU while CUDA/HIP graph capture is in progress.
+        self.gemm_counts[layer, stage_index].copy_(masked_m)
+        self.gemm_tags[layer, stage_index].fill_(variant)
+
+    def _sample_gemm(self):
+        from sglang.srt.observability.gemm_input_dump import masked_gemm_record
+
+        counts = self.gemm_counts.cpu().tolist()
+        tags = self.gemm_tags.cpu().tolist()
+        ep_rank = self.topology["ep_rank"]
+        n = self.metadata.num_local_physical_experts
+        mapping = self.metadata.physical_to_logical_map_cpu
+        for layer, stages in enumerate(tags):
+            for stage_index, variant in enumerate(stages):
+                if variant < 0:
+                    continue
+                record = masked_gemm_record(
+                    self.gemm_variants[variant],
+                    counts[layer][stage_index],
+                    run_id=self.run_id,
+                    rank=ep_rank,
+                    step=self.steps,
+                    logical_ids=mapping[
+                        layer, ep_rank * n : (ep_rank + 1) * n
+                    ].tolist(),
+                )
+                record["global_rank"] = self.global_rank
+                self.gemm_records.append(record)
+        self.gemm_sample_steps += 1
 
     @contextmanager
     def with_layer(self, layer):
@@ -160,6 +238,9 @@ class ExpertDistributionMonitor:
         self._include = eligible and self.state == "RECORDING"
         self._forward_at = time.time()
         self.scratch.zero_()
+        if self.config.dump_gemm:
+            self.gemm_counts.zero_()
+            self.gemm_tags.fill_(-1)
 
     def end_forward(self, *, graph=False):
         import torch
@@ -173,6 +254,8 @@ class ExpertDistributionMonitor:
                 :, ep_rank * n : (ep_rank + 1) * n
             ]
             self.physical.add_(self.scratch)
+            if self.config.dump_gemm:
+                self.gemm_total.add_(self.gemm_counts)
             self.logical.scatter_add_(1, mapping.long(), self.scratch)
             if self.scratch.is_cuda:
                 if self._last_event is None:
@@ -180,6 +263,11 @@ class ExpertDistributionMonitor:
                 self._last_event.record(torch.cuda.current_stream())
             self.steps += 1
             self.graph_steps += int(graph)
+            if (
+                self.config.dump_gemm
+                and self.gemm_sample_steps < self.config.gemm_max_steps
+            ):
+                self._sample_gemm()
             if self.first_forward_at is None:
                 self.first_forward_at = self._forward_at
             self.last_forward_at = self._forward_at
@@ -203,6 +291,8 @@ class ExpertDistributionMonitor:
             steps=self.steps,
             graph_steps=self.graph_steps,
             output_file=self.output_file,
+            gemm_inputs_file=self.gemm_inputs_file,
+            gemm_vs_dispatch_match=self.gemm_vs_dispatch_match,
             error=self.error,
         )
 
@@ -238,15 +328,45 @@ class ExpertDistributionMonitor:
             )
             directory = Path(self.config.output_dir) / self.run_id
             directory.mkdir(parents=True, exist_ok=True)
+            if self.config.dump_gemm:
+                gemm_total = self.gemm_total.cpu().tolist()
+                match = all(
+                    stages[0] == physical[layer] and stages[1] == physical[layer]
+                    for layer, stages in enumerate(gemm_total)
+                )
+                dump_path = directory / f"rank-{self.global_rank}.gemm_inputs.jsonl"
+                temporary_dump = dump_path.with_suffix(".jsonl.tmp")
+                with temporary_dump.open("w") as f:
+                    for record in self.gemm_records:
+                        f.write(json.dumps(record) + "\n")
+                temporary_dump.replace(dump_path)
+                self.gemm_inputs_file = str(dump_path.resolve())
+                self.gemm_vs_dispatch_match = match
+                output.update(
+                    gemm_inputs_file=str(dump_path.resolve()),
+                    gemm_sample_steps=self.gemm_sample_steps,
+                    gemm_physical_count=gemm_total,
+                    gemm_vs_dispatch_match=match,
+                )
+                if not match:
+                    logger.error(
+                        "[ExpertMonitor] GEMM/dispatch counts differ on rank %s",
+                        self.global_rank,
+                    )
             path = directory / f"rank-{self.global_rank}.json"
             temporary = path.with_suffix(".json.tmp")
             temporary.write_text(json.dumps(output))
             temporary.replace(path)
             self.output_file = str(path.resolve())
-            self.state = "DONE"
+            if self.config.dump_gemm and not self.gemm_vs_dispatch_match:
+                self.state = "FAILED"
+                self.error = "GEMM/dispatch counts differ"
+            else:
+                self.state = "DONE"
             logger.info(
-                "[ExpertMonitor] rank=%s DONE steps=%s graph_steps=%s file=%s",
+                "[ExpertMonitor] rank=%s %s steps=%s graph_steps=%s file=%s",
                 self.global_rank,
+                self.state,
                 self.steps,
                 self.graph_steps,
                 self.output_file,

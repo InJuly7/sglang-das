@@ -740,6 +740,8 @@ class ModelRunner:
                 raise ValueError(
                     "Expert monitor requires DeepEP low_latency, TP=DP=EP, PP=1, static topology"
                 )
+            if config.dump_gemm and (args.enable_two_batch_overlap or args.enable_single_batch_overlap):
+                raise ValueError("GEMM input dump requires TBO/SBO disabled")
             metadata = get_global_expert_location_metadata()
             if metadata is None:
                 raise ValueError("Expert monitor requires expert location metadata")

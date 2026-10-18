@@ -34,3 +34,21 @@ Graph capture includes scratch writes before the window starts. Whole forwards
 are admitted by submission time. Counting stays captured after expiry; disable
 via the startup flag for an uninstrumented performance comparison. No new
 per-step collectives are added; EPLB start/stop/dump never resets these counters.
+
+## DeepGEMM input dump
+
+Also set `SGLANG_EXPERT_DIST_DUMP_GEMM=1`. The first measured forward is sampled
+by default; `SGLANG_EXPERT_DIST_GEMM_MAX_STEPS=N` increases this bounded sample.
+TBO/SBO must be disabled. Dumps use the final library arguments of both
+`m_grouped_w4a8_gemm_nt_masked` and its HIPC variant, tagged `gate_up` / `down`.
+`rank-<rank>.gemm_inputs.jsonl` records input/scales/packed weight/output/mask
+shape, dtype, device, stride, contiguity, expected_m, E/M/N/K, valid/padded rows,
+per-expert counts, and physical/logical IDs. The masked API has `masked_m_values`
+instead of the contiguous API's `m_indices_runs` (reported as null).
+
+Captured GPU snapshots select the variant actually replayed; no CPU reads occur
+inside capture. Sampling does synchronize outside the graph and adds overhead.
+Whole-window `gemm_physical_count[layer][stage][slot]` is accumulated separately
+for each GEMM stage and checked against dispatch counts in
+`gemm_vs_dispatch_match`. Never add gate/up and down counts together when
+comparing expert assignments: both GEMMs process the same routed tokens.

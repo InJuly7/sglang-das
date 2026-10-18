@@ -1062,6 +1062,8 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     # Independent time-window decode expert monitor (not the EPLB recorder).
+    SGLANG_EXPERT_DIST_DUMP_GEMM = EnvBool(False)
+    SGLANG_EXPERT_DIST_GEMM_MAX_STEPS = EnvInt(1)
     SGLANG_EXPERT_DIST_ENABLE = EnvBool(False)
     SGLANG_EXPERT_DIST_DURATION_SEC = EnvFloat(60.0)
     SGLANG_EXPERT_DIST_DELAY_SEC = EnvFloat(0.0)

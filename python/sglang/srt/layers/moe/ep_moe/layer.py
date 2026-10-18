@@ -67,6 +67,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
+from sglang.srt.observability.expert_distribution_monitor import get_monitor
 from sglang.srt.layers.moe.utils import _get_deepgemm_shuffle_unique
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -371,7 +372,15 @@ def m_grouped_w4a8_gemm_nt_masked_wrapper(
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m_per_group: int,
+    layer_id: int = -1,
+    stage: str = "",
 ) -> torch.Tensor:
+    monitor = get_monitor()
+    if monitor is not None:
+        monitor.on_gemm(
+            "deepgemm.m_grouped_w4a8_gemm_nt_masked", layer_id, stage,
+            a0, a1, b0, b1, d, masked_m, expected_m_per_group,
+        )
     return m_grouped_w4a8_gemm_nt_masked(
         (a0, a1),
         (b0, b1),
@@ -389,6 +398,8 @@ def m_grouped_w4a8_gemm_nt_masked_fake(
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m_per_group: int,
+    layer_id: int = -1,
+    stage: str = "",
 ) -> torch.Tensor:
     return d
 
@@ -401,7 +412,15 @@ def m_grouped_w4a8_gemm_nt_masked_hipc_wrapper(
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m_per_group: int,
+    layer_id: int = -1,
+    stage: str = "",
 ) -> torch.Tensor:
+    monitor = get_monitor()
+    if monitor is not None:
+        monitor.on_gemm(
+            "deepgemm.m_grouped_w4a8_gemm_nt_masked_hipc", layer_id, stage,
+            a0, a1, b0, b1, d, masked_m, expected_m_per_group,
+        )
     return m_grouped_w4a8_gemm_nt_masked_hipc(
         (a0, a1),
         (b0, b1),
@@ -419,6 +438,8 @@ def m_grouped_w4a8_gemm_nt_masked_hipc_fake(
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m_per_group: int,
+    layer_id: int = -1,
+    stage: str = "",
 ) -> torch.Tensor:
     return d
 
@@ -1877,6 +1898,8 @@ class DeepEPMoE(FusedMoE):
             gateup_output,
             masked_m,
             expected_m,
+            self.layer_id,
+            "gate_up",
         )
 
         # Kimi K3 uses SiTU, not SiLU. Keep the original SiLU path intact for
@@ -1921,6 +1944,8 @@ class DeepEPMoE(FusedMoE):
             down_output,
             masked_m,
             expected_m,
+            self.layer_id,
+            "down",
         )
 
         return down_output

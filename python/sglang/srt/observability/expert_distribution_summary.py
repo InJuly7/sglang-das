@@ -29,6 +29,8 @@ def summarize(directory):
                 raise ValueError(f"Inconsistent {key}")
         if r["schema_version"] != 1:
             raise ValueError("Unsupported schema")
+        if r["config"].get("dump_gemm") and not r.get("gemm_vs_dispatch_match", False):
+            raise ValueError("GEMM/dispatch count verification failed")
         topology = {k: v for k, v in r["topology"].items() if k != "ep_rank"}
         reference = {k: v for k, v in first["topology"].items() if k != "ep_rank"}
         if topology != reference:
