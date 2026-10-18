@@ -30,6 +30,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+
 from sglang.srt.runtime_context import (
     attention_backends,
     configured_attn_cp_size,
@@ -139,6 +140,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    ExpertDistributionMonitorOutput,
+    ExpertDistributionMonitorReq,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -288,6 +291,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability.expert_distribution_monitor import get_monitor
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -1732,6 +1736,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
+                (ExpertDistributionMonitorReq, self.expert_distribution_monitor_handle),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (
@@ -2008,6 +2013,8 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
+        if (monitor := get_monitor()) is not None:
+            monitor.poll()
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         if get_mm().mm_feature_transport == "cuda_vmm":
@@ -5168,6 +5175,24 @@ class Scheduler(
         self.forward_sleep_time = t
         return SlowDownReqOutput()
 
+    def expert_distribution_monitor_handle(
+        self, recv_req: ExpertDistributionMonitorReq
+    ):
+        monitor = get_monitor()
+        if monitor is None:
+            status = {"state": "DISABLED"}
+        else:
+            try:
+                if recv_req.action == "arm":
+                    monitor.arm(recv_req.run_id, recv_req.trigger_at)
+                elif recv_req.action != "status":
+                    raise ValueError("Unknown expert monitor action")
+                monitor.poll()
+                status = monitor.status()
+            except Exception as exc:
+                status = {"state": "FAILED", "error": str(exc)}
+        return ExpertDistributionMonitorOutput(status=status)
+
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
@@ -5198,6 +5223,9 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
+        monitor = get_monitor()
+        if monitor is not None and monitor.state in ("DELAY", "RECORDING"):
+            return  # Keep polling the deadline even if no more requests arrive.
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 

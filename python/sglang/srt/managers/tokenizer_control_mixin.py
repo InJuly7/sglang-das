@@ -27,6 +27,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    ExpertDistributionMonitorOutput,
+    ExpertDistributionMonitorReq,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -121,6 +123,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("expert_distribution_monitor", ExpertDistributionMonitorOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
@@ -402,6 +405,42 @@ class TokenizerControlMixin:
         if not result.success:
             raise RuntimeError(result.message)
         return result
+
+    async def maybe_arm_expert_distribution_monitor(self: TokenizerManager):
+        from sglang.srt.observability.expert_distribution_monitor import MonitorConfig
+
+        if not MonitorConfig.from_env().enabled:
+            return
+        # Concurrent incoming requests share one task and wait for all rank acks.
+        if not hasattr(self, "_expert_dist_arm_task"):
+            self._expert_dist_arm_task = asyncio.create_task(self._arm_expert_monitor())
+        await asyncio.shield(self._expert_dist_arm_task)
+
+    async def _arm_expert_monitor(self: TokenizerManager):
+        try:
+            req = ExpertDistributionMonitorReq(
+                action="arm", run_id=uuid.uuid4().hex, trigger_at=time.time()
+            )
+            replies = await asyncio.wait_for(
+                self.expert_distribution_monitor_communicator(req), timeout=30
+            )
+            if any(r.status["state"] in ("DISABLED", "FAILED") for r in replies):
+                logger.error(
+                    "Expert monitor arm failed: %s", [r.status for r in replies]
+                )
+        except Exception:
+            # Observation failure must not take down inference.
+            logger.exception("Expert monitor arm failed; inference continues")
+
+    async def expert_distribution_monitor_status(self: TokenizerManager):
+        self.auto_create_handle_loop()
+        replies = await asyncio.wait_for(
+            self.expert_distribution_monitor_communicator(
+                ExpertDistributionMonitorReq()
+            ),
+            timeout=30,
+        )
+        return {"ranks": [r.status for r in replies]}
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()

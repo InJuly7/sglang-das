@@ -795,6 +795,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.server_status == ServerStatus.Up
+            and not is_health_check_generate_req(obj)
+        ):
+            await self.maybe_arm_expert_distribution_monitor()
+
         self._init_req_state(obj, request)
         try:
             if get_disagg().language_only:

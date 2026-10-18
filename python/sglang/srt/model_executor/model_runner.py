@@ -166,6 +166,12 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.observability.expert_distribution_monitor import (
+    ExpertDistributionMonitor,
+    MonitorConfig,
+    get_monitor,
+    set_monitor,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     ensure_published,
@@ -715,6 +721,48 @@ class ModelRunner:
             logger.info(
                 "Initial expert_location_metadata:\n%s",
                 format_expert_location_layout(get_global_expert_location_metadata()),
+            )
+        config = MonitorConfig.from_env()
+        if config.enabled:
+            args = self.server_args
+            if (
+                args.moe_a2a_backend != "deepep"
+                or args.deepep_mode != "low_latency"
+                or args.tp_size != args.ep_size
+                or args.dp_size != args.ep_size
+                or args.pp_size != 1
+                or args.elastic_ep_backend is not None
+                or args.tokenizer_worker_num != 1
+                or args.attn_cp_size != 1
+                or args.dcp_size != 1
+                or args.disaggregation_mode != "decode"
+            ):
+                raise ValueError(
+                    "Expert monitor requires DeepEP low_latency, TP=DP=EP, PP=1, static topology"
+                )
+            metadata = get_global_expert_location_metadata()
+            if metadata is None:
+                raise ValueError("Expert monitor requires expert location metadata")
+            set_monitor(
+                ExpertDistributionMonitor(
+                    config,
+                    metadata,
+                    device=self.device,
+                    global_rank=torch.distributed.get_rank(),
+                    topology=dict(
+                        ep_rank=expert_rank,
+                        ep_size=args.ep_size,
+                        tp_size=args.tp_size,
+                        dp_size=args.dp_size,
+                        nnodes=args.nnodes,
+                        enable_eplb=args.enable_eplb,
+                        ep_dispatch_algorithm=args.ep_dispatch_algorithm,
+                        redundant_experts=args.ep_num_redundant_experts,
+                        speculative_algorithm=args.speculative_algorithm,
+                        simulate_acc_len=envs.SGLANG_SIMULATE_ACC_LEN.get(),
+                        transfer_backend=args.disaggregation_transfer_backend,
+                    ),
+                )
             )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
@@ -1566,6 +1614,22 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        monitor = None if self.is_draft_worker else get_monitor()
+        if monitor is not None:
+            from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+
+            health_only = bool(forward_batch.rids) and all(
+                rid.startswith(HEALTH_CHECK_RID_PREFIX) for rid in forward_batch.rids
+            )
+            monitor.begin_forward(
+                not health_only and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                    # A DP-idle rank can still receive experts from busy peers.
+                    or forward_batch.forward_mode.is_idle()
+                )
+            )
+
         with (
             canary_ctx,
             step_span_ctx,
@@ -1599,6 +1663,8 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
+        if monitor is not None:
+            monitor.end_forward(graph=output.can_run_graph)
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule

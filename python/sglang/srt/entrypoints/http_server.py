@@ -1200,6 +1200,13 @@ async def freeze_gc_async():
     )
 
 
+@app.get("/expert_distribution_monitor")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def expert_distribution_monitor_status():
+    """Status of the independent time-window monitor; does not reset EPLB."""
+    return await _global_state.tokenizer_manager.expert_distribution_monitor_status()
+
+
 @app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_expert_distribution_record_async():

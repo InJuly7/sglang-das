@@ -2141,6 +2141,16 @@ class HealthCheckOutput(BaseReq, kw_only=True):
     pass
 
 
+class ExpertDistributionMonitorReq(BaseReq, kw_only=True):
+    action: str = "status"
+    run_id: Optional[str] = None
+    trigger_at: float = 0.0
+
+
+class ExpertDistributionMonitorOutput(BaseReq, kw_only=True):
+    status: Dict[str, Any]
+
+
 class ExpertDistributionReqType(Enum):
     START_RECORD = 1
     STOP_RECORD = 2

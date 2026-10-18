@@ -43,6 +43,7 @@ import torch.distributed
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.observability.expert_distribution_monitor import get_monitor
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     ExpertDispatchCollector,
@@ -105,7 +106,12 @@ class ExpertDistributionRecorder(ABC):
 
     @contextmanager
     def with_current_layer(self, layer_idx):
-        yield
+        monitor = get_monitor()
+        if monitor is None:
+            yield
+        else:
+            with monitor.with_layer(layer_idx):
+                yield
 
     @contextmanager
     def with_debug_name(self, debug_name):
@@ -113,7 +119,12 @@ class ExpertDistributionRecorder(ABC):
 
     @contextmanager
     def disable_this_region(self):
-        yield
+        monitor = get_monitor()
+        if monitor is None:
+            yield
+        else:
+            with monitor.disable():
+                yield
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
@@ -134,7 +145,9 @@ class ExpertDistributionRecorder(ABC):
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
     ):
-        pass
+        monitor = get_monitor()
+        if monitor is not None:
+            monitor.on_dispatch(local_physical_count_of_layer)
 
     def start_record(self):
         self._on_not_implemented()
@@ -189,8 +202,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
             self.start_record()
 
+    @contextmanager
     def with_current_layer(self, layer_idx):
-        return self._current_layer_idx.with_value(layer_idx)
+        with super().with_current_layer(layer_idx):
+            with self._current_layer_idx.with_value(layer_idx):
+                yield
 
     def with_debug_name(self, debug_name):
         return self._current_debug_name.with_value(debug_name)
@@ -211,7 +227,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         previous_disable_all = self._disable_all
         self._disable_all = True
         try:
-            yield
+            with super().disable_this_region():
+                yield
         finally:
             self._disable_all = previous_disable_all
 
@@ -254,6 +271,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
     ):
+        super().on_deepep_dispatch_low_latency(local_physical_count_of_layer)
         self._on_hook(
             "on_deepep_dispatch_low_latency",
             local_physical_count_of_layer=local_physical_count_of_layer,

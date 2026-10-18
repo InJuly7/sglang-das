@@ -448,6 +448,7 @@ class Resources(_FlagGroupBase):
     graph_memory_pool: Any = None
     # EPLB: per-process recorder and the publish-once location metadata
     # (owning accessors live in sglang.srt.eplb).
+    expert_distribution_monitor: Any = None
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
     # LPLB: layer_id -> solver.
