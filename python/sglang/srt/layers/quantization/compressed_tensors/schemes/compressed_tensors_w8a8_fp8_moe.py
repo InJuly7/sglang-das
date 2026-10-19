@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    get_deepgemm_marlin_weight_pack_fn,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
@@ -301,11 +302,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
 
-        from deepgemm.m_group_gemm import pack_int8_weight_enk_to_w6_low_latency
+        pack_fn = get_deepgemm_marlin_weight_pack_fn("fp8")
 
         with torch.no_grad():
-            w13_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w13).detach()
-            w2_deepgemm = pack_int8_weight_enk_to_w6_low_latency(w2).detach()
+            w13_deepgemm = pack_fn(w13).detach()
+            w2_deepgemm = pack_fn(w2).detach()
 
         self._register_runtime_buffer(layer, "w13_weight_deepgemm", w13_deepgemm)
         self._register_runtime_buffer(layer, "w2_weight_deepgemm", w2_deepgemm)
