@@ -26,9 +26,21 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+)
+
+# Leading-dim (token/seq) tensor fields on LogitsProcessorOutput that BCG must
+# pad / slice / copy. Sampler-filled and list fields stay None during capture.
+_LOGITS_ROW_TENSOR_FIELDS = (
+    "next_token_logits",
+    "hidden_states",
+    "full_logits",
+    "draft_top1_token_ids",
+    "draft_top1_probs",
+    "mm_input_embeds",
 )
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
     DedupedCudaGraphMixin,
@@ -125,9 +137,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
-        size = shape_key.size
+        # shape_key.size is decode *bs*; speculative verify emits
+        # bs * num_tokens_per_req logits, so size the shared buffer from the
+        # body's real leading dim rather than clamping to bs.
+        body_rows = max(shape_key.size, self._output_rows(warmup_out, 1 << 30))
         if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, body_rows)
+        else:
+            cur_cap = self._output_rows(self._shared_output_buffer, 1 << 30)
+            if body_rows > cur_cap:
+                self._shared_output_buffer = self._alloc_full_buffer(
+                    warmup_out, body_rows
+                )
         with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=self._pool,
@@ -135,7 +156,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             barrier_fn=self._tp_group.barrier,
         ):
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
+            out_rows = max(shape_key.size, self._output_rows(out, 1 << 30))
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
         stored = self._slice_output(self._shared_output_buffer, out_rows)
@@ -155,6 +176,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
+        if isinstance(output, LogitsProcessorOutput):
+            rows = [
+                getattr(output, name).shape[0]
+                for name in _LOGITS_ROW_TENSOR_FIELDS
+                if getattr(output, name, None) is not None
+            ]
+            return min([cap, *rows]) if rows else cap
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
         return cap
@@ -172,6 +200,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if isinstance(output, LogitsProcessorOutput):
+            kwargs = {
+                name: (
+                    None
+                    if (t := getattr(output, name)) is None
+                    else t.new_empty((size, *t.shape[1:]))
+                )
+                for name in _LOGITS_ROW_TENSOR_FIELDS
+            }
+            # Preserve non-row metadata that capture may populate.
+            kwargs["customized_info"] = output.customized_info
+            return LogitsProcessorOutput(**kwargs)
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -185,6 +225,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            kwargs = {
+                name: (
+                    None
+                    if (t := getattr(output, name)) is None
+                    else t[:num_tokens]
+                )
+                for name in _LOGITS_ROW_TENSOR_FIELDS
+            }
+            kwargs["customized_info"] = output.customized_info
+            return LogitsProcessorOutput(**kwargs)
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -216,6 +267,22 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
                 )
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for name in _LOGITS_ROW_TENSOR_FIELDS:
+                src = getattr(output, name)
+                dst = getattr(output_buffer, name)
+                if src is None and dst is None:
+                    continue
+                if src is None or dst is None:
+                    raise ValueError(
+                        "BCG LogitsProcessorOutput field presence changed: "
+                        f"{name} src={src is not None} dst={dst is not None}"
+                    )
+                self._copy_output_to_buffer(src, dst, num_tokens)
+            output_buffer.customized_info = output.customized_info
             return
         if isinstance(output, (list, tuple)) and isinstance(
             output_buffer, type(output)
