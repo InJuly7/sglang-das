@@ -515,7 +515,14 @@ def _run_mega_routed(
     if _IS_HCU:
         if getattr(moe.experts, "_mega_moe_hcu_w4a8_weights", False):
             y = _run_standalone_hcu_w4a8_mega_moe(
-                hidden_states, topk_ids, topk_weights, moe, buf,
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                moe=moe,
+                buf=buf,
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                dispatch_num_tokens=dispatch_num_tokens,
             )
         elif runtime == _HCU_MEGA_MOE_RUNTIME_MEGAMOE:
             y = _run_standalone_hcu_w8a8_mega_moe(
@@ -719,25 +726,70 @@ def _run_standalone_hcu_w8a8_mega_moe(
     return y[:num_tokens]
 
 
-def _run_standalone_hcu_w4a8_mega_moe(hidden_states, topk_ids, topk_weights, moe, buf):
+def _run_standalone_hcu_w4a8_mega_moe(
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+    moe: DeepseekV2MoE,
+    buf,
+    num_tokens: int,
+    hidden_size: int,
+    dispatch_num_tokens: int,
+) -> torch.Tensor:
     from lightop.quant import per_token_quant_int8
-    from megamoe.w4a8 import w4a8_mega_moe
+    from megamoe.w4a8 import _stage_w4a8_inputs, w4a8_mega_moe
 
-    tokens, hidden = hidden_states.shape
-    if tokens:
-        qx, scale = per_token_quant_int8(hidden_states)
-        buf.x[:tokens].copy_(qx)
-        buf.x_sf[:tokens].copy_(scale.reshape(-1))
-        buf.topk_idx[:tokens].copy_(topk_ids)
-        buf.topk_weights[:tokens].copy_(topk_weights)
-    y = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=hidden_states.device)
+    is_graph_capture = get_is_capture_mode()
+    if num_tokens == 0 and dispatch_num_tokens == 0:
+        return torch.empty(
+            (0, hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+
+    if num_tokens > 0:
+        if not is_graph_capture:
+            _stage_w4a8_inputs(hidden_states, topk_ids, topk_weights, buf)
+        else:
+            qx, scale = per_token_quant_int8(hidden_states)
+            buf.x[:num_tokens].copy_(qx)
+            buf.x_sf[:num_tokens].copy_(scale.reshape(-1))
+            buf.topk_idx[:num_tokens].copy_(topk_ids)
+            buf.topk_weights[:num_tokens].copy_(topk_weights)
+
+    # Size y to this shape's token count so the captured W4A8 graph GEMM grid
+    # tracks the batch (workspace views are sliced to need_rows(tokens)).
+    # Barrier capacity still uses the fixed buf.cuda_graph_max_tokens_per_rank.
+    y = torch.empty(
+        (num_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    api_kwargs = {}
+    # Route-kernel scan bound: graph uses the fixed decode bucket; eager/prefill
+    # uses this step's max tokens (not SymmBuffer num_max, often 32768).
+    scan_tokens = max(int(num_tokens), int(dispatch_num_tokens))
+    if is_graph_capture:
+        api_kwargs["graph"] = True
+        api_kwargs["capacity_num_tokens"] = int(buf.cuda_graph_max_tokens_per_rank)
+    elif scan_tokens > 0:
+        api_kwargs["capacity_num_tokens"] = scan_tokens
     # Empty ranks still participate in routing and both peer-memory barriers.
     w4a8_mega_moe(
-        y, moe.experts.mega_l1_weights, moe.experts.mega_l2_weights, buf,
+        y,
+        moe.experts.mega_l1_weights,
+        moe.experts.mega_l2_weights,
+        buf,
         activation_clamp=getattr(moe.config, "swiglu_limit", None),
-        combine_group_map=getattr(moe.experts, "mega_w4a8_combine_groups", None),
+        # DeepEP rounds each physical EP rank's weighted expert partial to
+        # BF16 before combining ranks. EPLB changes physical ownership; using
+        # logical expert groups here changes the reduction rounding.
+        combine_group_map=None,
+        **api_kwargs,
     )
     return y
+
 
 
 def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
