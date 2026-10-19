@@ -266,6 +266,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):
             return
+        # Breakable-CG MegaMoE runs as an eager graph node whose replay is
+        # outside the layer `with_current_layer` scope, so layer_idx is None.
+        if self._current_layer_idx.value is None:
+            return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value
@@ -562,10 +566,18 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        topk_ids = topk_ids.flatten()
-        mask = topk_ids != -1
-        self._data[layer_idx, :].scatter_add_(
-            dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
+        if layer_idx is None:
+            return
+        # Force a python int so advanced indexing cannot keep a leading dim
+        # (e.g. layer_idx as a 1-element tensor -> shape [1, E]), which breaks
+        # scatter_add under breakable-CG MegaMoE eager replay.
+        row = self._data[int(layer_idx)]
+        flat = topk_ids.reshape(-1)
+        mask = flat != -1
+        row.scatter_add_(
+            dim=0,
+            index=flat.masked_fill(~mask, 0).long(),
+            src=mask.to(dtype=row.dtype),
         )
 
 
