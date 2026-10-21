@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
@@ -1035,6 +1036,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         prefill_dsa_topk = None
         if seed_from_extend:
             prefill_dsa_topk = self.dsa_extend_topk_buf[:bs].clone()
+            backend = self.draft_extend_attn_backend
+            if (
+                getattr(backend, "use_fused_topk", False)
+                and backend.get_topk_transform_method(forward_batch.forward_mode)
+                == TopkTransformMethod.RAGGED
+            ):
+                # Ragged TopK addresses concatenated logical KV; draft decode
+                # needs physical slots, including for requests sharing a prefix.
+                seq_lens = forward_batch.seq_lens[:bs]
+                kv_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+                valid = prefill_dsa_topk >= 0
+                logical_positions = torch.where(
+                    valid, prefill_dsa_topk - kv_starts[:, None], 0
+                ).long()
+                physical_slots = self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices[:bs, None].long(),
+                    logical_positions,
+                ]
+                prefill_dsa_topk = torch.where(valid, physical_slots, -1).to(
+                    torch.int32
+                )
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
