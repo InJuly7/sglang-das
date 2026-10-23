@@ -793,6 +793,26 @@ class TestEagleConfigurator(CustomTestCase):
 
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
+    def test_hicache_does_not_disable_skip_topk_elision(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            _should_elide_dsa_index_k,
+        )
+
+        _publish_config(
+            self,
+            enable_hisparse=False,
+            enable_hierarchical_cache=False,
+            enable_unified_cache_external_linker=False,
+        )
+        for hicache in (False, True):
+            with self.subTest(hicache=hicache), get_memory().override(
+                enable_hierarchical_cache=hicache,
+                enable_hisparse=False,
+                enable_unified_cache_external_linker=False,
+            ):
+                self.assertTrue(_should_elide_dsa_index_k(is_draft_worker=False))
+                self.assertFalse(_should_elide_dsa_index_k(is_draft_worker=True))
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
