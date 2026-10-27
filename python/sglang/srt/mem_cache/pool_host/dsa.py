@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    alloc_with_pin_memory,
     get_allocator_from_storage,
     kernel_accessible_host_ptr,
 )
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 class DSAIndexerPoolHost(HostKVCache):
-    """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
+    """Compact Index-K layers with token/page slots shared by the MLA anchor."""
 
     device_pool: DSATokenToKVPool
 
@@ -73,7 +74,19 @@ class DSAIndexerPoolHost(HostKVCache):
         self.end_layer = device_pool.end_layer
         # FP8 and HCU INT8 share the packed uint8 K+scale storage ABI.
         self.use_scaled_index_cache = device_pool.use_scaled_index_k_cache
-        self.target_layer_num = self._effective_host_layer_num()
+        # Device buffers are indexed by active indexer layers, while transfers
+        # are scheduled by model layer. Keep the host's owned-only layer axis
+        # separate from both, including when PP starts at a nonzero layer.
+        self.target_device_layer_ids = tuple(
+            layer_id - self.start_layer
+            for layer_id in device_pool.indexer_layer_ids
+            if self._is_device_layer_owned(device_pool, layer_id - self.start_layer)
+        )
+        self.target_layer_id_to_host_index = {
+            layer_id: index
+            for index, layer_id in enumerate(self.target_device_layer_ids)
+        }
+        self.target_layer_num = len(self.target_device_layer_ids)
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
@@ -135,6 +148,14 @@ class DSAIndexerPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def get_transfer_layer_mapping(self) -> dict[int, int]:
+        # Target transfers retain local model layer ids; load_to_device_per_layer
+        # resolves their device and host indices. Packed drafts use host offsets.
+        return {layer_id: layer_id for layer_id in self.target_device_layer_ids} | {
+            self.device_pool.layer_num + depth: self.target_layer_num + depth
+            for depth in range(len(self.mtp_draft_device_pools))
+        }
+
     def _infer_bf16_indexer_size_per_token(self, device_pool) -> int:
         for buffer in device_pool.index_k_buffer:
             if buffer.shape[0] > 0:
@@ -158,11 +179,22 @@ class DSAIndexerPoolHost(HostKVCache):
         return self.get_size_per_token()
 
     def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
+        # A shard containing only shared-topk layers has no Index-K storage.
+        # Do not pass a zero-byte allocation to a host registration backend.
+        alloc_func = (
+            ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            if self.layer_num
+            else alloc_with_pin_memory
+        )
+        target_buffers = self._get_device_index_k_cache_for_transfer(self.device_pool)
         self.packed_device_index_buffers = [
+            target_buffers[
+                self.device_pool._get_indexer_cache_index(self.start_layer + layer_id)
+            ]
+            for layer_id in self.target_device_layer_ids
+        ] + [
             buffer
-            for pool in device_pools
+            for pool in self.mtp_draft_device_pools
             for buffer in self._get_device_index_k_cache_for_transfer(pool)
         ]
         self.index_k_device_ptrs = torch.tensor(
@@ -204,7 +236,11 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layer_num == 0
+            or self.layout != "page_first"
+            or (_is_npu or _is_xpu or _is_mps)
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
@@ -225,7 +261,7 @@ class DSAIndexerPoolHost(HostKVCache):
         )
 
     def get_hybrid_pool_buffer(self):
-        return [self.index_k_with_scale_buffer]
+        return [self.index_k_with_scale_buffer] if self.layer_num else []
 
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
@@ -252,11 +288,19 @@ class DSAIndexerPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
-        device_layer_id = 0 if is_draft else layer_id
-        if not self._is_device_layer_owned(device_pool, device_layer_id):
-            return
         # Packed draft host offsets differ from the draft device layer (zero).
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        if is_draft:
+            host_layer_id = layer_id
+            device_layer_id = device_pool._get_indexer_cache_index(
+                device_pool.start_layer
+            )
+        else:
+            host_layer_id = self.target_layer_id_to_host_index.get(layer_id)
+            if host_layer_id is None:
+                return
+            device_layer_id = device_pool._get_indexer_cache_index(
+                device_pool.start_layer + layer_id
+            )
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
             if _is_hcu and self._is_device_layer_sharded(device_pool)
@@ -325,8 +369,12 @@ class DSAIndexerPoolHost(HostKVCache):
         is_draft: bool = False,
     ):
         # Packed draft host offsets differ from the draft device layer (zero).
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        host_layer_id = (
+            layer_id if is_draft else self.target_layer_id_to_host_index[layer_id]
+        )
+        device_layer_id = device_pool._get_indexer_cache_index(
+            device_pool.start_layer + (0 if is_draft else layer_id)
+        )
         hcu_layer_split_kwargs = (
             {"num_warps_per_block": 4}
             if _is_hcu and self._is_device_layer_sharded(device_pool)
@@ -391,8 +439,10 @@ class DSAIndexerPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self.layer_num == 0:
+            return
         if self._is_device_layer_sharded(device_pool):
-            for layer_id in self._owned_device_layer_ids(device_pool):
+            for layer_id in self.target_device_layer_ids:
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
                 )
