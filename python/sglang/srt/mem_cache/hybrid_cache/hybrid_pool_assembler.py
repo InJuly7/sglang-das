@@ -955,6 +955,9 @@ def build_anchor_sidecar_stack(
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
+    # Index-K can omit shared-topk layers and therefore has its own packed
+    # draft offsets. Do not reuse the Main-KV mapping for this sidecar.
+    sidecar_layer_mapping = sidecar_host_pool.get_transfer_layer_mapping()
     # Expose packed MTP tail layers to the controller's flat transfer builder.
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(
@@ -976,7 +979,7 @@ def build_anchor_sidecar_stack(
             name=sidecar_pool_name,
             host_pool=sidecar_host_pool,
             device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
+            layer_mapping=sidecar_layer_mapping,
             transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
         ),
     ]
@@ -1103,8 +1106,8 @@ def build_full_draft_pools(
                 name=PoolName.DRAFT_INDEXER,
                 host_pool=indexer_host_pool,
                 device_pool=pool,
-                layer_mapping=draft_layer_mapping,
-                transfer_layer_num=indexer_host_pool.layer_num,
+                layer_mapping=indexer_host_pool.get_transfer_layer_mapping(),
+                transfer_layer_num=pool.layer_num,
             )
         )
 
