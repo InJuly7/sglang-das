@@ -542,6 +542,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             or self._uses_dsa_decode_radix_cache()
         )
 
+    def _log_decode_radix_transfer_plan(
+        self,
+        req: Req,
+        *,
+        prompt_tokens: int,
+        prefix_tokens: int,
+        transfer_pages: int,
+        page_size: int,
+        state_indices: Optional[List],
+    ) -> None:
+        if not self._uses_mla_decode_radix_cache() or not (
+            envs.SGLANG_DEBUG_DECODE_RADIX_CACHE.get()
+            or envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get()
+        ):
+            return
+
+        index_k_pages = 0
+        for state_type, indices in zip(
+            self.kv_manager.kv_args.state_types, state_indices or []
+        ):
+            if state_type == StateType.DSA and indices is not None:
+                index_k_pages += len(indices)
+        logger.info(
+            "Decode radix transfer plan: rid=%s pool=%s "
+            "prompt_tokens=%d decode_prefix_len=%d "
+            "kv_transfer_tokens=%d kv_transfer_pages=%d page_size=%d "
+            "draft_kv_included=%s index_k_transfer_pages=%d",
+            req.rid,
+            type(self.token_to_kv_pool).__name__,
+            prompt_tokens,
+            prefix_tokens,
+            prompt_tokens - prefix_tokens,
+            transfer_pages,
+            page_size,
+            self.draft_token_to_kv_pool is not None,
+            index_k_pages,
+        )
+
     def _decode_radix_compression_ratios(self) -> List[int]:
         # DSV4 exposes per-layer compression ratios; plain MLA/DSA pools do not
         # compress, so treat them as ratio 1 (page-size alignment only). This
@@ -2172,21 +2210,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             metadata_kwargs = {}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
-            if (
-                self._uses_dsv4_decode_radix_cache()
-                and envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get()
-            ):
-                logger.info(
-                    "DSV4 decode radix transfer stats: rid=%s "
-                    "origin_input_len=%d decode_prefix_len=%d "
-                    "transfer_tokens=%d transfer_pages=%d page_size=%d",
-                    decode_req.req.rid,
-                    origin_input_len,
-                    total_prefix_len,
-                    origin_input_len - total_prefix_len,
-                    len(page_indices),
-                    kv_transfer_page_size,
-                )
+            self._log_decode_radix_transfer_plan(
+                decode_req.req,
+                prompt_tokens=origin_input_len,
+                prefix_tokens=total_prefix_len,
+                transfer_pages=len(page_indices),
+                page_size=kv_transfer_page_size,
+                state_indices=state_indices,
+            )
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")

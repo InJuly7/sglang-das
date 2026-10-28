@@ -249,9 +249,12 @@ class SchedulerBatchResultProcessor:
                 req.dsv4_donated_swa_len = max(
                     int(getattr(req, "dsv4_donated_swa_len", 0) or 0), radix_key_len
                 )
-            if envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get():
+            if (
+                envs.SGLANG_DEBUG_DECODE_RADIX_CACHE.get()
+                or envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.get()
+            ):
                 logger.info(
-                    "DSV4 decode radix prompt inserted: rid=%s "
+                    "Decode radix prompt inserted: rid=%s "
                     "prompt_len=%d radix_key_len=%d",
                     req.rid,
                     prompt_len,

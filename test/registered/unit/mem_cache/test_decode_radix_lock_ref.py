@@ -45,8 +45,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -153,6 +155,42 @@ class TestDSADecodeMainKVRadix(unittest.TestCase):
             )
         )
 
+    def test_dsa_transfer_log_distinguishes_kv_suffix_from_full_index_k(self):
+        queue = self._queue()
+        queue.draft_token_to_kv_pool = object()
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[StateType.DSA])
+        )
+        for debug, prefix, expected_pages in (
+            (False, 128, 2),
+            (True, 0, 4),
+            (True, 128, 2),
+            (True, 256, 0),
+        ):
+            with (
+                self.subTest(debug=debug, prefix=prefix),
+                envs.SGLANG_DEBUG_DECODE_RADIX_CACHE.override(debug),
+                envs.SGLANG_DEBUG_DSV4_DECODE_RADIX_TRANSFER.override(False),
+                patch("sglang.srt.disaggregation.decode.logger") as logger,
+            ):
+                queue._log_decode_radix_transfer_plan(
+                    SimpleNamespace(rid="test"),
+                    prompt_tokens=256,
+                    prefix_tokens=prefix,
+                    transfer_pages=expected_pages,
+                    page_size=64,
+                    state_indices=[[1, 2, 3, 4]],
+                )
+                if not debug:
+                    logger.info.assert_not_called()
+                    continue
+                fmt, *values = logger.info.call_args.args
+                message = fmt % tuple(values)
+                self.assertIn(f"decode_prefix_len={prefix}", message)
+                self.assertIn(f"kv_transfer_tokens={256 - prefix}", message)
+                self.assertIn(f"kv_transfer_pages={expected_pages}", message)
+                self.assertIn("draft_kv_included=True", message)
+                self.assertIn("index_k_transfer_pages=4", message)
     def test_dsa_donation_reuses_main_slots_without_swa_bookkeeping(self):
         cache, slots = _make_cache_with_pools(page_size=4)
         processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
