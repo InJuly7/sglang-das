@@ -671,6 +671,43 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
+    def test_pd_decode_radix_cache_keeps_dsa_mtp_enabled(self):
+        args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+            )
+        )
+        with patch.object(ServerArgs, "get_model_config", return_value=model_config):
+            args._handle_pd_disaggregation()
+        self.assertEqual(args.speculative_algorithm, "EAGLE")
+        self.assertFalse(args.disable_radix_cache)
+
+    def test_dsa_mtp_allowance_does_not_enable_other_models_or_tree_drafts(self):
+        for arch, topk in (("LlamaForCausalLM", 1), ("GlmMoeDsaForCausalLM", 2)):
+            with self.subTest(arch=arch, topk=topk):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="EAGLE",
+                    speculative_eagle_topk=topk,
+                )
+                model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
+                )
+                with patch.object(
+                    ServerArgs, "get_model_config", return_value=model_config
+                ):
+                    self.assertFalse(
+                        pd_disaggregation_hook._allow_dsa_decode_radix_mtp(args)
+                    )
+
     def test_pd_decode_radix_cache_rejects_dspark_without_experimental_dsv4(self):
         server_args = ServerArgs(
             model_path="dummy",

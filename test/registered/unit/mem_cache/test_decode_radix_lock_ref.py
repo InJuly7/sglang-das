@@ -42,17 +42,20 @@ register_hcu_ci(est_time=10, suite="nightly-hcu-1", nightly=True)
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.utils.common import Range
 
@@ -106,6 +109,83 @@ class MockReq:
 
 def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
     return MockReq(fill_ids, req_pool_idx, cache_protected_len, last_node)
+
+
+class TestDSADecodeMainKVRadix(unittest.TestCase):
+    def _queue(self, enabled=True):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                disaggregation_decode_enable_radix_cache=enabled
+            ),
+            running_batch=SimpleNamespace(reqs=[]),
+        )
+        queue.token_to_kv_pool = object.__new__(DSATokenToKVPool)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)
+        queue.transfer_queue = SimpleNamespace(queue=[])
+        return queue
+
+    def test_plain_dsa_aligns_without_compression_metadata(self):
+        queue = self._queue()
+        self.assertTrue(queue._uses_mla_decode_radix_cache())
+        self.assertEqual(queue._dsv4_safe_prefix_len(191), 128)
+        self.assertEqual(queue._dsv4_singleflight_min_prefix_len(), 4096)
+        queue.scheduler.server_args.disaggregation_decode_enable_radix_cache = False
+        self.assertFalse(queue._uses_mla_decode_radix_cache())
+
+    def test_dsa_waits_for_inflight_prompt_donation(self):
+        queue = self._queue()
+        leader = SimpleNamespace(
+            origin_input_ids=list(range(5000)),
+            dsv4_decode_radix_cache_prompt_once=True,
+        )
+        follower = SimpleNamespace(origin_input_ids=list(range(5000)))
+        queue.scheduler.running_batch.reqs = [leader]
+        self.assertTrue(
+            queue._should_wait_for_dsv4_inflight_prompt(
+                follower, prefix_len=0, preallocated_reqs=[]
+            )
+        )
+        leader.dsv4_decode_radix_cache_prompt_once = False
+        self.assertFalse(
+            queue._should_wait_for_dsv4_inflight_prompt(
+                follower, prefix_len=0, preallocated_reqs=[]
+            )
+        )
+
+    def test_dsa_donation_reuses_main_slots_without_swa_bookkeeping(self):
+        cache, slots = _make_cache_with_pools(page_size=4)
+        processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
+        processor.tree_cache = cache
+        processor.model_config = SimpleNamespace(sliding_window_size=None)
+        fill_ids = list(range(12))
+        for req_idx, start in ((0, 16), (1, 32)):
+            with self.subTest(req_idx=req_idx):
+                req = _make_req(
+                    fill_ids, req_pool_idx=req_idx, last_node=cache.root_node
+                )
+                req.kv.swa_evicted_seqlen = 0
+                req.skip_radix_cache_insert = True
+                req.dsv4_decode_radix_cache_prompt_once = True
+                req.dsv4_decode_radix_cache_prompt_len = len(fill_ids)
+                slots[req_idx, :12] = torch.arange(start, start + 12)
+                with patch(
+                    "sglang.srt.managers.scheduler_components.batch_result_processor."
+                    "free_swa_out_of_window_slots"
+                ) as free_swa:
+                    processor._maybe_insert_dsv4_decode_radix_prompt(req)
+                    free_swa.assert_not_called()
+                # The duplicate request repoints to the existing main-KV prefix.
+                self.assertEqual(slots[req_idx, :12].tolist(), list(range(16, 28)))
+                self.assertEqual(req.cache_protected_len, 12)
+                self.assertEqual(req.kv.swa_evicted_seqlen, 0)
+                self.assertFalse(hasattr(req, "dsv4_donated_swa_len"))
+                self.assertFalse(req.dsv4_decode_radix_cache_prompt_once)
+                # Later decode steps must not donate again.
+                with patch.object(cache, "cache_unfinished_req") as insert:
+                    processor._maybe_insert_dsv4_decode_radix_prompt(req)
+                    insert.assert_not_called()
+                cache.dec_lock_ref(req.last_node)
 
 
 class TestDecodeLockRefScenarios(unittest.TestCase):

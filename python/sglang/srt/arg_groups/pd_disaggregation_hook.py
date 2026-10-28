@@ -30,6 +30,19 @@ def _allow_dsv4_decode_radix_speculative(server_args: ServerArgs) -> bool:
     )
 
 
+def _allow_dsa_decode_radix_mtp(server_args: ServerArgs) -> bool:
+    """DSA NextN shares main/draft KV prefix reuse and delta-only transfer."""
+    if (server_args.speculative_algorithm or "").upper() not in (
+        "EAGLE",
+        "NEXTN",
+    ) or server_args.speculative_eagle_topk != 1:
+        return False
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    return is_deepseek_dsa(server_args.get_model_config().hf_config)
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
@@ -98,6 +111,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             if (
                 server_args.speculative_algorithm is not None
                 and not _allow_dsv4_decode_radix_speculative(server_args)
+                and not _allow_dsa_decode_radix_mtp(server_args)
             ):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "

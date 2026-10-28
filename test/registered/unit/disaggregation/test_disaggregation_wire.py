@@ -8,6 +8,8 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
 )
@@ -26,6 +28,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
 )
 from sglang.srt.disaggregation.utils import (
+    KVClassType,
     MetadataBuffers,
     build_kv_layer_ids,
     build_transfer_entry_pairs,
@@ -39,6 +42,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -507,6 +511,77 @@ def _make_dsv4_draft(*, unified, mapping=None):
         )
     return pool
 
+
+class TestDSADraftSharedKVRegistration(unittest.TestCase):
+    def _pool(self, kv_ptr, index_ptr):
+        pool = Mock(spec=DSATokenToKVPool)
+        pool.page_size = 64
+        pool.start_layer = 0
+        pool.end_layer = 1
+        pool.layer_num = 1
+        pool.get_kv_layer_ids.return_value = [0]
+        pool.get_contiguous_buf_infos.return_value = ([kv_ptr], [65536], [8192])
+        pool.get_state_buf_infos.return_value = ([index_ptr], [67584], [8448])
+        pool.get_state_layer_ids.return_value = [0]
+        pool.get_index_k_cache_transfer_abi.return_value = "dsa-index-k-page-v1:fp8"
+        return pool
+
+    def test_main_and_draft_share_kv_transfer_buffers_on_both_sides(self):
+        for queue_type, module in (
+            (PrefillBootstrapQueue, "sglang.srt.disaggregation.prefill"),
+            (DecodePreallocQueue, "sglang.srt.disaggregation.decode"),
+        ):
+            for enabled in (False, True):
+                with self.subTest(side=module, radix=enabled):
+                    queue = queue_type.__new__(queue_type)
+                    queue.token_to_kv_pool = self._pool(100, 200)
+                    queue.draft_token_to_kv_pool = self._pool(300, 400)
+                    queue.scheduler = SimpleNamespace(
+                        server_args=SimpleNamespace(
+                            disaggregation_decode_enable_radix_cache=enabled,
+                            speculative_algorithm="EAGLE",
+                        ),
+                        enable_hisparse=False,
+                        model_config=SimpleNamespace(num_hidden_layers=12),
+                        ps=SimpleNamespace(dp_rank=0, gpu_id=0),
+                        tp_worker=SimpleNamespace(
+                            model_runner=SimpleNamespace(kv_cache_dtype_str="fp8_e4m3")
+                        ),
+                    )
+                    queue.tp_rank = queue.pp_rank = 0
+                    queue.pp_size = 1
+                    queue.is_mla_backend = True
+                    queue.enable_staging = False
+                    queue.transfer_backend = "mooncake"
+                    queue.metadata_buffers = SimpleNamespace(
+                        get_buf_infos=lambda: ([], [], [])
+                    )
+
+                    def kv_class(backend, kind):
+                        if kind == KVClassType.KVARGS:
+                            return KVArgs
+                        return lambda args, *rest: SimpleNamespace(kv_args=args)
+
+                    with (
+                        patch(module + ".get_kv_class", side_effect=kv_class),
+                        patch(
+                            module + ".get_parallel",
+                            return_value=SimpleNamespace(attn_tp_size=1),
+                        ),
+                        patch(
+                            module + ".get_disagg",
+                            return_value=SimpleNamespace(disaggregation_ib_device=None),
+                        ),
+                        envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+                    ):
+                        args = queue._init_kv_manager().kv_args
+                    # The main KV suffix page list also addresses the draft KV.
+                    self.assertEqual(args.kv_data_ptrs, [100, 300])
+                    self.assertEqual(args.kv_item_lens, [8192, 8192])
+                    self.assertEqual(args.kv_layer_ids, [0, 12])
+                    # Only Index-K (+ its scales) remains in full-prompt state.
+                    self.assertEqual(args.state_types, [StateType.DSA])
+                    self.assertEqual(args.state_data_ptrs, [[200, 400]])
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
     def test_draft_state_is_a_separate_component(self):
