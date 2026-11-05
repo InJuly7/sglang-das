@@ -42,7 +42,9 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
+    build_dcp_transfer_addresses,
     group_concurrent_contiguous,
+    localize_num_kv_tokens_for_page_slice,
     pack_int_lists,
     pack_string_list,
     unpack_int_lists,
@@ -280,6 +282,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
+            # Retain registered buffers for the manager/engine lifetime. Each
+            # synchronous transfer worker owns one bounded packing buffer.
+            self._dcp_packers = {}
+            self._dcp_packer_lock = threading.Lock()
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -1133,6 +1139,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
     ) -> int:
+        diag = os.environ.get("SGLANG_DCP_TRANSFER_DIAGNOSTICS") == "1" and self.attn_cp_rank == 0 and self.pp_rank == 0
+        t0 = time.perf_counter()
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
@@ -1146,6 +1154,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
         )
+        t_plan = time.perf_counter()
         if plan.src_token_indices.size == 0:
             return 0
 
@@ -1165,11 +1174,65 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_kv_ptrs,
             )
         layers_current_pp_stage = len(src_kv_ptrs)
+        pack_capacity = int(os.environ.get("SGLANG_DCP_PACK_BUFFER_MB", "32")) * 1024 * 1024
+        pack_item_lens = dcp_token_item_lens[:layers_current_pp_stage]
+        pack_bytes = int(plan.src_token_indices.size) * sum(pack_item_lens)
+        if (
+            os.environ.get("SGLANG_DCP_PACKED_TRANSFER") == "1"
+            and not self.enable_custom_mem_pool
+            and 0 < pack_capacity <= 512 * 1024 * 1024
+            and plan.src_token_indices.size >= 128
+            # Long transfers are split into capacity-bounded synchronous batches.
+            and 0 < sum(pack_item_lens) <= pack_capacity
+        ):
+            from sglang.srt.disaggregation.mooncake.dcp_packed_transfer import DCPPackedTransfer
+            worker = threading.get_ident()
+            packer = self._dcp_packers.get(worker)
+            if packer is None:
+                with self._dcp_packer_lock:
+                    packer = DCPPackedTransfer(self.engine, self.kv_args.gpu_id, pack_capacity)
+                    self._dcp_packers[worker] = packer
+            ret, blocks = packer.send(
+                mooncake_session_id, plan.src_token_indices, plan.dst_token_indices,
+                src_kv_ptrs, dst_kv_ptrs, pack_item_lens,
+            )
+            if diag:
+                logger.info("DCP_TRANSFER_PHASE %s", json.dumps({
+                    "target_dcp_rank": dst_dcp_rank, "input_tokens": num_kv_tokens,
+                    "owned_tokens": int(plan.src_token_indices.size),
+                    "layers": layers_current_pp_stage, "blocks": blocks,
+                    "actual_main_kv_bytes": pack_bytes, "packed": True,
+                    "plan_ms": (t_plan-t0)*1000, "groups_ms": 0.0,
+                    "custom_pool": False, **packer.last_stats,
+                }))
+            return ret
+        if os.environ.get("SGLANG_DCP_VECTORIZED_TRANSFER") == "1" and not self.enable_custom_mem_pool:
+            src_addrs, dst_addrs, lengths = build_dcp_transfer_addresses(
+                plan.src_token_indices, plan.dst_token_indices,
+                src_kv_ptrs, dst_kv_ptrs, dcp_token_item_lens[:layers_current_pp_stage],
+            )
+            t_blocks = time.perf_counter()
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths,
+            )
+            if diag:
+                logger.info("DCP_TRANSFER_PHASE %s", json.dumps({
+                    "target_dcp_rank": dst_dcp_rank, "input_tokens": num_kv_tokens,
+                    "owned_tokens": int(plan.src_token_indices.size),
+                    "layers": layers_current_pp_stage, "blocks": len(lengths),
+                    "actual_main_kv_bytes": sum(lengths), "vectorized": True,
+                    "plan_ms": (t_plan-t0)*1000, "groups_ms": 0.0,
+                    "blocks_ms": (t_blocks-t_plan)*1000,
+                    "engine_ms": (time.perf_counter()-t_blocks)*1000,
+                    "custom_pool": False,
+                }))
+            return ret
         src_groups, dst_groups = group_concurrent_contiguous(
             plan.src_token_indices,
             plan.dst_token_indices,
         )
 
+        t_groups = time.perf_counter()
         layers_params = [
             (
                 src_kv_ptrs[layer_id],
@@ -1209,7 +1272,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             transfer_blocks.extend(
                 set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
             )
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+        t_blocks = time.perf_counter()
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+        if diag:
+            logger.info("DCP_TRANSFER_PHASE %s", json.dumps({
+                "target_dcp_rank": dst_dcp_rank, "input_tokens": num_kv_tokens,
+                "owned_tokens": int(plan.src_token_indices.size),
+                "layers": len(layers_params), "blocks": len(transfer_blocks),
+                "actual_main_kv_bytes": sum(block[2] for block in transfer_blocks),
+                "plan_ms": (t_plan-t0)*1000, "groups_ms": (t_groups-t_plan)*1000,
+                "blocks_ms": (t_blocks-t_groups)*1000,
+                "engine_ms": (time.perf_counter()-t_blocks)*1000,
+                "custom_pool": self.enable_custom_mem_pool,
+            }))
+        return ret
 
     def send_kvcache_slice(
         self,
@@ -3022,6 +3098,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        # DCP peers share a destination set. Endpoint-only hashing can serialize
+        # all DP groups in one queue. Keep each request's chunks ordered while
+        # allowing independent requests to use different workers. Session failure
+        # checks remain shared under session_lock in transfer_worker.
+        dcp_request_sharding = (
+            os.environ.get("SGLANG_DCP_REQUEST_QUEUE_SHARDING") == "1"
+            and not self.enable_staging
+            and any(
+                getattr(self.decode_kv_args_table.get(session), "requires_dcp_relayout", False)
+                for session in dst_infos
+            )
+        )
+        if dcp_request_sharding:
+            shard_idx = bootstrap_room % len(self.transfer_queues)
+        if os.environ.get("SGLANG_DCP_TRANSFER_DIAGNOSTICS") == "1" and self.attn_cp_rank == 0 and self.pp_rank == 0:
+            logger.info("DCP_TRANSFER_QUEUE %s", json.dumps({
+                "room": bootstrap_room, "queue": shard_idx,
+                "legacy_queue": session_port_sum % len(self.transfer_queues),
+                "targets": len(dst_infos), "is_last_chunk": is_last_chunk,
+                "request_sharding": dcp_request_sharding,
+            }))
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -3168,12 +3265,21 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        original_page_start = self.curr_idx
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
             self._source_event = None
             return
+
+        num_kv_tokens = localize_num_kv_tokens_for_page_slice(
+            num_kv_tokens,
+            original_page_start=original_page_start,
+            sliced_page_start=index_slice.start or 0,
+            sliced_page_count=len(kv_indices),
+            physical_page_size=self.kv_mgr.kv_args.page_size,
+        )
 
         pd_hidden_chunk_meta = self._pd_hidden_chunk_meta
         self._pd_hidden_chunk_meta = None

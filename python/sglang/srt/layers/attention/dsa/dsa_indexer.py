@@ -272,6 +272,12 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
     return hadamard_transform(x, scale=scale)
 
 
+
+def _get_index_page_size(pool) -> int:
+    # Index-K storage keeps physical pages when draft MLA KV uses virtual DCP pages.
+    return getattr(pool, "index_page_size", pool.page_size)
+
+
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
@@ -476,7 +482,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key,
             pool.get_index_k_with_scale_write_buffer(layer_id=layer_id),
             out_cache_loc.contiguous(),
-            pool.page_size,
+            _get_index_page_size(pool),
             weights,
             hadamard_scale * self.softmax_scale,
             hadamard_scale,
@@ -853,7 +859,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = _get_index_page_size(pool)
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -1017,7 +1023,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         kv_cache = self._get_index_k_read_buffer(pool, layer_id)
         assert len(kv_cache.shape) == 2
         return (
-            kv_cache.view(kv_cache.shape[0], pool.page_size, 1, self.head_dim + 4),
+            kv_cache.view(kv_cache.shape[0], _get_index_page_size(pool), 1, self.head_dim + 4),
             False,
         )
 
@@ -1030,9 +1036,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         packed_cache = self._get_index_k_read_buffer(pool, layer_id)
         assert packed_cache.dtype == torch.uint8
         assert packed_cache.dim() == 2
-        assert packed_cache.shape[1] == pool.page_size * (self.head_dim + 4)
+        assert packed_cache.shape[1] == _get_index_page_size(pool) * (self.head_dim + 4)
         return packed_cache.view(torch.int8).view(
-            packed_cache.shape[0], pool.page_size, 1, self.head_dim + 4
+            packed_cache.shape[0], _get_index_page_size(pool), 1, self.head_dim + 4
         )
 
     def _prepare_hcu_int8_paged_query(
@@ -1121,7 +1127,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = _get_index_page_size(pool)
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
@@ -1547,7 +1553,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert effective_forward_mode(forward_batch).is_extend_without_speculative()
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = _get_index_page_size(pool)
         if _is_hip and not _is_hcu:
             if _use_aiter_preshuffle:
                 assert (
@@ -1917,7 +1923,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
+        page_size = _get_index_page_size(pool)
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
@@ -2163,7 +2169,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key,
                 write_buffer,
                 out_cache_loc.contiguous(),
-                pool.page_size,
+                _get_index_page_size(pool),
                 1e-5,
                 False,
                 not _is_fp8_fnuz,
@@ -2179,7 +2185,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                pool.page_size,
+                _get_index_page_size(pool),
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
@@ -2188,7 +2194,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key,
                 buf,
                 out_cache_loc,
-                pool.page_size,
+                _get_index_page_size(pool),
             )
             return
 
@@ -2198,7 +2204,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.page_size
+            page_size = _get_index_page_size(pool)
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc

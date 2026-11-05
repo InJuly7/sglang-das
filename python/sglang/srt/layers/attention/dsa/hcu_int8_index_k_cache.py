@@ -262,7 +262,10 @@ def _dequantize_index_k_int8_paged_kernel(
     context_lens_ptr,
     workspace_ptr,
     page_claims_ptr,
-    block_table_stride_0: tl.constexpr,
+    # This stride grows with the live context length during chunked prefill.
+    # Keeping it constexpr creates a fresh Triton binary for nearly every
+    # chunk, stalling long requests with serving-time compilation.
+    block_table_stride_0,
     k_page_stride_0: tl.constexpr,
     scale_page_stride_0: tl.constexpr,
     workspace_page_stride_0: tl.constexpr,

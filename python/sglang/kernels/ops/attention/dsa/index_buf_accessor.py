@@ -32,6 +32,11 @@ s: scale, 1 item per token, fp32
 """
 
 
+def _get_index_page_size(pool) -> int:
+    # DSA draft KV can use virtual pages; other indexer pools retain page_size.
+    return getattr(pool, "index_page_size", pool.page_size)
+
+
 class GetK:
     @classmethod
     def execute(cls, *args, **kwargs):
@@ -41,8 +46,8 @@ class GetK:
     def slow(
         cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
-        num_pages = (seq_len + pool.page_size - 1) // pool.page_size
-        seq_len_ = num_pages * pool.page_size
+        num_pages = (seq_len + _get_index_page_size(pool) - 1) // _get_index_page_size(pool)
+        seq_len_ = num_pages * _get_index_page_size(pool)
         index_k_fp8 = torch.empty(
             (seq_len_, pool.index_head_dim),
             dtype=torch.uint8,
@@ -50,9 +55,9 @@ class GetK:
         )
         for i in range(num_pages):
             page_index = page_indices[i]
-            index_k_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
+            index_k_fp8[i * _get_index_page_size(pool) : (i + 1) * _get_index_page_size(pool)] = buf[
                 page_index
-            ][: pool.page_size * pool.index_head_dim].view(-1, pool.index_head_dim)
+            ][: _get_index_page_size(pool) * pool.index_head_dim].view(-1, pool.index_head_dim)
 
         return index_k_fp8[:seq_len]
 
@@ -70,7 +75,7 @@ class GetK:
         # page_indices: (num_pages,), element := a page index
         buf_numel_per_page = buf.shape[1]
 
-        num_k_bytes_per_page = pool.page_size * pool.index_head_dim
+        num_k_bytes_per_page = _get_index_page_size(pool) * pool.index_head_dim
         num_k_bytes_per_token = pool.index_head_dim
 
         # buf: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4), uint8
@@ -99,7 +104,7 @@ class GetK:
             buf=buf,
             page_indices=page_indices,
             seq_len=seq_len,
-            page_size=pool.page_size,
+            page_size=_get_index_page_size(pool),
             index_head_dim=pool.index_head_dim,
         )
 
@@ -113,8 +118,8 @@ class GetS:
     def slow(
         cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
-        num_pages = (seq_len + pool.page_size - 1) // pool.page_size
-        seq_len_ = num_pages * pool.page_size
+        num_pages = (seq_len + _get_index_page_size(pool) - 1) // _get_index_page_size(pool)
+        seq_len_ = num_pages * _get_index_page_size(pool)
         assert pool.index_head_dim // pool.quant_block_size == 1
         index_k_scale_fp8 = torch.empty(
             (seq_len_, 4),
@@ -123,9 +128,9 @@ class GetS:
         )
         for i in range(num_pages):
             page_index = page_indices[i]
-            index_k_scale_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
+            index_k_scale_fp8[i * _get_index_page_size(pool) : (i + 1) * _get_index_page_size(pool)] = buf[
                 page_index
-            ][pool.page_size * pool.index_head_dim :].view(-1, 4)
+            ][_get_index_page_size(pool) * pool.index_head_dim :].view(-1, 4)
         return index_k_scale_fp8[:seq_len]
 
     @classmethod
@@ -138,9 +143,9 @@ class GetS:
         """
         buf_numel_per_page = buf.shape[1]
 
-        num_s_bytes_per_page = buf.shape[1] - pool.page_size * pool.index_head_dim
+        num_s_bytes_per_page = buf.shape[1] - _get_index_page_size(pool) * pool.index_head_dim
         num_s_bytes_per_token = pool.index_head_dim // pool.quant_block_size * 4
-        s_offset_in_page = pool.page_size * pool.index_head_dim
+        s_offset_in_page = _get_index_page_size(pool) * pool.index_head_dim
 
         flat_buf = buf.flatten()
         flat_indices = (
@@ -168,7 +173,7 @@ class GetS:
             buf=buf,
             page_indices=page_indices,
             seq_len=seq_len,
-            page_size=pool.page_size,
+            page_size=_get_index_page_size(pool),
             index_head_dim=pool.index_head_dim,
         )
 
@@ -196,7 +201,7 @@ class GetKAndS:
     ):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
-        page_size = pool.page_size
+        page_size = _get_index_page_size(pool)
         index_head_dim = pool.index_head_dim
         quant_block_size = pool.quant_block_size
         scale_elems = index_head_dim // quant_block_size
@@ -252,7 +257,7 @@ class GetKAndS:
             seq_lens=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
-            page_size=pool.page_size,
+            page_size=_get_index_page_size(pool),
             index_head_dim=pool.index_head_dim,
         )
 
@@ -271,7 +276,7 @@ class SetKAndS:
             loc=loc,
             index_k=index_k,
             index_k_scale=index_k_scale,
-            page_size=pool.page_size,
+            page_size=_get_index_page_size(pool),
         )
 
 

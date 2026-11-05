@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -105,6 +106,7 @@ _is_hcu = is_hcu()
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+_LOG2_E = 1.4426950408889634
 
 if is_cuda():
     import deep_gemm
@@ -113,6 +115,148 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _validate_dsa_dcp_launch(
+    *,
+    dcp_enabled: bool,
+    dcp_size: int,
+    is_hcu_platform: bool,
+    device_capability: tuple[int, int],
+    dsa_prefill_impl: str,
+    dsa_decode_impl: str,
+    dsa_kv_cache_store_fp8: bool,
+    page_size: int,
+    enable_prefill_cp: bool,
+    enable_hisparse: bool,
+    enable_hierarchical_cache: bool,
+    enable_symm_mem: bool,
+    speculative_algorithm: Optional[str],
+    fused_topk_enabled: bool,
+    dcp_comm_backend: str,
+    speculative_num_steps: Optional[int],
+    speculative_eagle_topk: Optional[int],
+    speculative_num_draft_tokens: Optional[int],
+    pp_size: int,
+    attn_cp_size: int,
+    enable_dp_attention: bool,
+    attn_tp_size: int,
+    dcp_group_ranks: Tuple[int, ...],
+    attn_tp_group_ranks: Tuple[int, ...],
+    index_share_for_mtp_iteration: bool,
+    decode_cuda_graph_backend: str,
+    decode_cuda_graph_max_bs: Optional[int],
+) -> None:
+    """Reject DSA-DCP combinations outside the validated first phase."""
+    if not dcp_enabled:
+        return
+    if dcp_size not in (2, 4, 8):
+        raise ValueError(f"DSA DCP supports dcp size 2, 4, or 8; got {dcp_size}.")
+    supported_capability = (
+        device_capability == (9, 3) if is_hcu_platform else device_capability == (9, 0)
+    )
+    if not supported_capability:
+        platform_name = "HCU" if is_hcu_platform else "CUDA"
+        raise ValueError(
+            "DSA DCP first-phase support requires Hopper SM90 or HCU BW1000; "
+            f"got {platform_name} capability {device_capability}."
+        )
+    if (dsa_prefill_impl, dsa_decode_impl) != ("flashmla_kv", "flashmla_kv"):
+        raise ValueError(
+            "DSA DCP first-phase support requires flashmla_kv for both prefill "
+            f"and decode; got {dsa_prefill_impl}/{dsa_decode_impl}."
+        )
+    if not dsa_kv_cache_store_fp8:
+        raise ValueError("DSA DCP first-phase support requires an FP8 KV cache.")
+    if page_size != 64:
+        raise ValueError(
+            f"DSA DCP first-phase support requires page size 64; got {page_size}."
+        )
+    if enable_prefill_cp:
+        raise ValueError("DSA DCP does not support prefill CP in the first phase.")
+    if enable_hisparse:
+        raise ValueError("DSA DCP does not support HiSparse in the first phase.")
+    if enable_hierarchical_cache:
+        raise ValueError("DSA DCP does not support HiCache in the first phase.")
+    if enable_symm_mem:
+        raise ValueError("DSA DCP does not support symmetric memory in the first phase.")
+    if speculative_algorithm is not None:
+        if not is_hcu_platform:
+            raise ValueError("DSA DCP speculative decoding is only supported on HCU.")
+        if speculative_algorithm != "EAGLE":
+            raise ValueError(
+                "DSA DCP speculative decoding only supports EAGLE; "
+                f"got {speculative_algorithm}."
+            )
+        speculative_parameters = {
+            "num_steps": speculative_num_steps,
+            "eagle_topk": speculative_eagle_topk,
+            "num_draft_tokens": speculative_num_draft_tokens,
+        }
+        invalid_parameters = {
+            name: value
+            for name, value in speculative_parameters.items()
+            if value is None or value <= 0
+        }
+        if invalid_parameters:
+            raise ValueError(
+                "DSA DCP EAGLE requires positive speculative parameters; "
+                f"got {invalid_parameters}."
+            )
+        if attn_tp_size != dcp_size:
+            raise ValueError(
+                "DSA DCP EAGLE requires attn_tp_size == dcp_size; got "
+                f"dcp_size={dcp_size}, attn_tp_size={attn_tp_size}."
+            )
+        if tuple(dcp_group_ranks) != tuple(attn_tp_group_ranks):
+            raise ValueError(
+                "DSA DCP EAGLE requires identical DCP and attention TP group ranks; "
+                f"got dcp={tuple(dcp_group_ranks)}, "
+                f"attn_tp={tuple(attn_tp_group_ranks)}."
+            )
+        if pp_size != 1 or attn_cp_size != 1 or not enable_dp_attention:
+            raise ValueError(
+                "DSA DCP EAGLE requires PP1, attnCP1, and DP attention; got "
+                f"pp_size={pp_size}, attn_cp_size={attn_cp_size}, "
+                f"enable_dp_attention={enable_dp_attention}."
+            )
+        if index_share_for_mtp_iteration:
+            raise ValueError(
+                "DSA DCP EAGLE does not support index_share_for_mtp_iteration "
+                "in the first phase."
+            )
+        if decode_cuda_graph_backend not in ("disabled", "full"):
+            raise ValueError(
+                "DSA DCP EAGLE only supports disabled or full decode CUDA Graph; "
+                f"got {decode_cuda_graph_backend}."
+            )
+        if decode_cuda_graph_backend == "full" and (
+            decode_cuda_graph_max_bs is None or decode_cuda_graph_max_bs <= 0
+        ):
+            raise ValueError(
+                "DSA DCP EAGLE CUDA Graph requires a positive max BS; "
+                f"got {decode_cuda_graph_max_bs}."
+            )
+    if fused_topk_enabled:
+        raise ValueError(
+            "DSA DCP does not support fused DSA top-k in the first phase; set "
+            "SGLANG_DSA_FUSE_TOPK=false."
+        )
+    if dcp_comm_backend != "ag_rs":
+        raise ValueError(
+            "DSA DCP first-phase support requires the ag_rs communication backend; "
+            f"got {dcp_comm_backend}."
+        )
+
+
+def _get_flashmla_module():
+    """Return the platform FlashMLA package without replacing its abstractions."""
+    if _is_hcu:
+        import flash_mla
+    else:
+        from sgl_kernel import flash_mla
+
+    return flash_mla
 
 
 def _all_gather_dsa_trtllm_fp8_kv(
@@ -368,6 +512,54 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self._lightop_decode_gather = None
+        self._lightop_decode_gather_workspace: Optional[torch.Tensor] = None
+        self._lightop_decode_compact_indices: Optional[torch.Tensor] = None
+        # CUDA graphs retain raw addresses. Keep every superseded allocation
+        # alive when an eager MTP phase grows the active workspace.
+        self._lightop_decode_retained_workspaces: Dict[
+            int, Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._lightop_decode_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self._lightop_decode_gather_width = self.dsa_index_topk
+        lightop_decode_requested = envs.SGLANG_DSA_HCU_USE_BF16_FLASH_MLA.get()
+        lightop_decode_static_compatible = (
+            _is_hcu
+            and self.dsa_decode_impl == "flashmla_kv"
+            and self.dsa_kv_cache_store_fp8
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and self.kv_cache_dim == 656
+            and self.dsa_index_topk == 2048
+            and self.real_page_size == 64
+        )
+        if lightop_decode_requested:
+            if not lightop_decode_static_compatible:
+                raise RuntimeError(
+                    "SGLANG_DSA_HCU_USE_BF16_FLASH_MLA requires HCU DSA "
+                    "flashmla_kv with packed FP8 main KV (rank=512, rope=64, "
+                    "topk=2048, page_size=64)"
+                )
+            try:
+                from lightop import op as lightop_op
+
+                self._lightop_decode_gather = getattr(
+                    lightop_op, "decode_gather_and_up_convert_with_indices", None
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "SGLANG_DSA_HCU_USE_BF16_FLASH_MLA was requested, but "
+                    "LightOp could not be imported"
+                ) from exc
+            if self._lightop_decode_gather is None:
+                raise RuntimeError(
+                    "Installed LightOp does not expose "
+                    "decode_gather_and_up_convert_with_indices"
+                )
+            logger.info(
+                "HCU DSA BF16 FlashMLA enabled: packed FP8 KV -> LightOp "
+                "gather/up-convert -> BF16 sparse FlashMLA."
+            )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -433,6 +625,61 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        parallel = get_parallel()
+        self.dcp_enabled = parallel.dcp_enabled
+        self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
+        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
+        _validate_dsa_dcp_launch(
+            dcp_enabled=self.dcp_enabled,
+            dcp_size=self.dcp_size,
+            is_hcu_platform=_is_hcu,
+            device_capability=self.device_capability,
+            dsa_prefill_impl=self.dsa_prefill_impl,
+            dsa_decode_impl=self.dsa_decode_impl,
+            dsa_kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
+            page_size=self.real_page_size,
+            enable_prefill_cp=model_runner.server_args.enable_prefill_cp,
+            enable_hisparse=model_runner.server_args.enable_hisparse,
+            enable_hierarchical_cache=model_runner.server_args.enable_hierarchical_cache,
+            enable_symm_mem=model_runner.server_args.enable_symm_mem,
+            speculative_algorithm=model_runner.server_args.speculative_algorithm,
+            fused_topk_enabled=envs.SGLANG_DSA_FUSE_TOPK.get(),
+            dcp_comm_backend=parallel.dcp_comm_backend,
+            speculative_num_steps=model_runner.server_args.speculative_num_steps,
+            speculative_eagle_topk=model_runner.server_args.speculative_eagle_topk,
+            speculative_num_draft_tokens=(
+                model_runner.server_args.speculative_num_draft_tokens
+            ),
+            pp_size=model_runner.server_args.pp_size,
+            attn_cp_size=parallel.attn_cp_size,
+            enable_dp_attention=model_runner.server_args.enable_dp_attention,
+            attn_tp_size=parallel.attn_tp_size,
+            dcp_group_ranks=(
+                tuple(parallel.dcp_group.ranks) if self.dcp_enabled else ()
+            ),
+            attn_tp_group_ranks=tuple(parallel.attn_tp_group.ranks),
+            index_share_for_mtp_iteration=getattr(
+                model_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            ),
+            decode_cuda_graph_backend=(
+                model_runner.server_args.cuda_graph_config.decode.backend
+            ),
+            decode_cuda_graph_max_bs=(
+                model_runner.server_args.cuda_graph_config.decode.max_bs
+            ),
+        )
+        if self.dcp_enabled:
+            # The model gathers Q across the DCP group before FlashMLA.
+            dcp_num_q_heads = self.num_q_heads * self.dcp_size
+            if dcp_num_q_heads <= 64:
+                self.flashmla_kv_num_q_heads = 64
+            elif dcp_num_q_heads <= 128:
+                self.flashmla_kv_num_q_heads = 128
+            else:
+                self.flashmla_kv_num_q_heads = dcp_num_q_heads
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -1241,6 +1488,7 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        self._allocate_lightop_decode_workspaces(max_num_tokens)
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -2132,6 +2380,8 @@ class DeepseekSparseAttnBackend(
                         or forward_mode.is_draft_extend_v2()
                     ),
                     cu_seqlens_q=metadata.cu_seqlens_q,
+                    dcp_size=self.dcp_size,
+                    dcp_rank=self.dcp_rank,
                 )
 
         # todo hisparse: to cover more backends
@@ -2304,6 +2554,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                return_lse=self.dcp_enabled,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2426,6 +2677,8 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
@@ -2464,6 +2717,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                return_lse=self.dcp_enabled,
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2557,7 +2811,8 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         indices_are_sorted: bool = False,
         attn_sink: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         flash_mla_sparse_fwd = get_flashmla_op("flash_mla_sparse_fwd", is_hcu=_is_hcu)
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
@@ -2637,7 +2892,7 @@ class DeepseekSparseAttnBackend(
             )
 
         if raw_sparse_prefill_fwd is not None:
-            o, _, _ = raw_sparse_prefill_fwd(
+            o, _, lse = raw_sparse_prefill_fwd(
                 q_input,
                 kv_cache,
                 indices_input,
@@ -2649,7 +2904,7 @@ class DeepseekSparseAttnBackend(
                 topk_length,
             )
         else:
-            o, _, _ = flash_mla_sparse_fwd(
+            o, _, lse = flash_mla_sparse_fwd(
                 q=q_input,
                 kv=kv_cache,
                 indices=indices_input,
@@ -2663,6 +2918,8 @@ class DeepseekSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
 
+        if return_lse:
+            return o, lse
         return o
 
     def q8kv8_born_fp8_q_eligible(
@@ -3003,6 +3260,59 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _allocate_lightop_decode_workspaces(self, capacity: int) -> None:
+        if self._lightop_decode_gather is None or capacity <= 0:
+            return
+        current_capacity = (
+            0
+            if self._lightop_decode_gather_workspace is None
+            else self._lightop_decode_gather_workspace.shape[0]
+        )
+        if current_capacity >= capacity:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DSA LightOp decode gather workspace must be allocated before "
+                "CUDA graph capture"
+            )
+        if (
+            self._lightop_decode_gather_workspace is not None
+            and self._lightop_decode_compact_indices is not None
+        ):
+            self._lightop_decode_retained_workspaces[current_capacity] = (
+                self._lightop_decode_gather_workspace,
+                self._lightop_decode_compact_indices,
+            )
+        logger.info(
+            "Allocating LightOp decode workspace: old_capacity=%d, new_capacity=%d",
+            current_capacity,
+            capacity,
+        )
+        self._lightop_decode_gather_workspace = torch.empty(
+            (capacity, self._lightop_decode_gather_width, self._lightop_decode_head_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._lightop_decode_compact_indices = torch.empty(
+            (capacity, self._lightop_decode_gather_width),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def _get_lightop_decode_workspaces(
+        self, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._allocate_lightop_decode_workspaces(num_tokens)
+        if (
+            self._lightop_decode_gather_workspace is None
+            or self._lightop_decode_compact_indices is None
+        ):
+            raise RuntimeError("DSA LightOp decode gather workspaces are unavailable")
+        return (
+            self._lightop_decode_gather_workspace[:num_tokens],
+            self._lightop_decode_compact_indices[:num_tokens],
+        )
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -3012,8 +3322,9 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        forward_batch: Optional[ForwardBatch] = None,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         flash_mla_with_kvcache = get_flashmla_op(
             "flash_mla_with_kvcache", is_hcu=_is_hcu
         )
@@ -3055,27 +3366,99 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
+        forward_mode = (
+            effective_forward_mode(forward_batch)
+            if forward_batch is not None else ForwardMode.DECODE
+        )
+        is_decode_family = (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
+        lightop_kv_cache = None
+        if self._lightop_decode_gather is not None and kv_cache.is_contiguous():
+            if kv_cache.dtype == torch.uint8:
+                lightop_kv_cache = kv_cache
+            elif kv_cache.dtype == torch.float8_e4m3fn:
+                lightop_kv_cache = kv_cache.view(torch.uint8)
+        use_lightop_decode_gather = (
+            self._lightop_decode_gather is not None
+            and is_decode_family
+            and q_input.dtype == torch.bfloat16
+            and q_input.shape[-1] == self._lightop_decode_head_dim
+            and v_head_dim == self.kv_lora_rank
+            and lightop_kv_cache is not None
+            and lightop_kv_cache.is_contiguous()
+            and lightop_kv_cache.shape[-1] == self.kv_cache_dim
+            and indices.dtype in (torch.int32, torch.int64)
+            and indices.is_contiguous()
+            and cache_seqlens.dtype == torch.int32
+            and cache_seqlens.is_contiguous()
+        )
+        if (
+            self._lightop_decode_gather is not None
+            and is_decode_family
+            and not use_lightop_decode_gather
+        ):
+            raise RuntimeError(
+                "SGLANG_DSA_HCU_USE_BF16_FLASH_MLA runtime tensor contract "
+                "does not match the LightOp gather/up-convert path"
+            )
+
         # MLP-sync can append synthetic speculative rows. HCU FlashMLA must
         # only see the real prefix; downstream MLP-sync still needs the padded
         # output shape, so restore it after the kernel returns.
         num_total = q_input.shape[0]
-        num_valid = get_flashmla_kv_valid_rows(forward_batch, num_total)
+        num_valid = (
+            get_flashmla_kv_valid_rows(forward_batch, num_total)
+            if forward_batch is not None
+            else None
+        )
         needs_repad = _is_hcu and num_valid is not None
         flashmla_metadata = metadata.flashmla_metadata
         if needs_repad:
             q_input = q_input[:num_valid]
             indices = indices[:num_valid]
             cache_seqlens = cache_seqlens[:num_valid]
-            if num_valid > 0:
+            if num_valid > 0 and not use_lightop_decode_gather:
                 flashmla_metadata = self._compute_flashmla_metadata(
                     cache_seqlens=cache_seqlens,
                     seq_len_q=1,
                 )
 
+        lse_is_base2 = False
         if needs_repad and num_valid == 0:
             o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
+            lse = torch.empty(
+                (0, target_q_heads, 1), dtype=torch.float32, device=q_input.device
+            )
+        elif use_lightop_decode_gather:
+            flash_mla_sparse_fwd = get_flashmla_op(
+                "flash_mla_sparse_fwd", is_hcu=_is_hcu
+            )
+            gathered_kv, compact_indices = self._get_lightop_decode_workspaces(
+                q_input.shape[0]
+            )
+            self._lightop_decode_gather(
+                lightop_kv_cache,
+                indices[:, 0, :],
+                gathered_kv,
+                cache_seqlens,
+                compact_indices,
+            )
+            o, _, lse = flash_mla_sparse_fwd(
+                q=q_input[:, 0],
+                kv=gathered_kv.view(-1, 1, self._lightop_decode_head_dim),
+                indices=compact_indices.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
+            o = o.unsqueeze(1)
+            lse = lse.unsqueeze(-1)
+            # sparse_prefill_fwd returns base-2 LSE, unlike dense FlashMLA.
+            lse_is_base2 = True
         else:
-            o, _ = flash_mla_with_kvcache(
+            o, lse = flash_mla_with_kvcache(
                 q=q_input,
                 k_cache=kv_cache,
                 cache_seqlens=cache_seqlens,
@@ -3095,9 +3478,35 @@ class DeepseekSparseAttnBackend(
             full_o = o.new_zeros((num_total, *o.shape[1:]))
             full_o[:num_valid] = o
             o = full_o
+            full_lse = lse.new_zeros((num_total, *lse.shape[1:]))
+            full_lse[:num_valid] = lse
+            lse = full_lse
 
         if target_q_heads != num_q_heads:
-            o = o[:, :, :num_q_heads, :].contiguous()
+            o = o[:, :, :num_q_heads, :]
+            lse = lse[:, :num_q_heads, :]
+
+        if return_lse:
+            # Dense FlashMLA exposes natural-log LSE; ag_rs consumes base-2.
+            # sparse_prefill_fwd already returns base-2 LSE.
+            o = o.squeeze(1).contiguous()
+            lse = lse.squeeze(-1).to(torch.float32)
+            if not lse_is_base2:
+                lse = lse.mul_(_LOG2_E)
+            lse = lse.contiguous()
+
+            # Owner filtering may leave a rank with no local sparse KV. Such
+            # rows must be the online-softmax identity before the DCP merge.
+            local_kv_counts = (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32)
+            batch_size = page_table_1.shape[0]
+            fixup_zero_kv_rows(
+                o,
+                lse,
+                local_kv_counts,
+                self.get_device_int32_arange(batch_size + 1),
+                max_seq_len=1,
+            )
+            return o, lse
 
         return o
 
@@ -3458,6 +3867,8 @@ class DeepseekSparseAttnBackend(
                     or effective_forward_mode(forward_batch).is_draft_extend_v2()
                 ),
                 cu_seqlens_q=metadata.cu_seqlens_q,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
             if topk_indices is not None:
@@ -3466,6 +3877,8 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
 
         page_table_1 = self._translate_main_kv_loc_to_compact(page_table_1)

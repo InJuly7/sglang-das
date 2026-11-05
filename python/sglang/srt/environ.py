@@ -1587,6 +1587,8 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
     )
     # gfx936-only: page-planar INT8 K plus one FP32 scale per token.
+    SGLANG_DSA_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
+    SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC = EnvBool(False)
     SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
     )
