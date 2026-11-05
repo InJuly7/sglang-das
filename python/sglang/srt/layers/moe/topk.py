@@ -2393,6 +2393,40 @@ def _post_process_topk_ids(
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
         remap_info = expert_location_dispatch_info if _eplb_remap_enabled() else None
+        if remap_info is not None and remap_info.ep_dispatch_algorithm == "lp":
+            # Resolve LP dispatch for every HIP backend before padding or the
+            # compiled postprocess. Restricting this to DeepEP + DeepGEMM leaves
+            # other backends remapping with log2phy_prob=None.
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            solver = get_global_lplb_solver(layer_id)
+            if solver is None:
+                raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
+            # AITER appends shared experts below; other per-rank shared-slot
+            # paths already include them. Only routed IDs belong in the LP.
+            has_shared_cols = use_per_rank_shared_slots and not _use_aiter
+            routed_ids = (
+                topk_ids[:, :-num_fused_shared_experts] if has_shared_cols else topk_ids
+            )
+            probabilities = solver.solve(routed_ids)
+            if hasattr(solver, "static_dispatch_map"):
+                from sglang.kernels.ops.lplb import cuda_solver
+
+                routed_ids = cuda_solver.dispatch_probability(
+                    routed_ids, probabilities, solver.static_dispatch_map
+                )
+            else:
+                routed_ids = topk_ids_logical_to_physical(
+                    routed_ids, remap_info, probabilities
+                )
+            topk_ids = (
+                torch.cat([routed_ids, topk_ids[:, -num_fused_shared_experts:]], dim=-1)
+                if has_shared_cols
+                else routed_ids
+            )
+            if has_shared_cols:
+                recorder_topk_ids = routed_ids
+            remap_info = None  # IDs are physical; do not remap a second time.
         if skip_deepep_padded_tokens and not use_per_rank_shared_slots:
             # DeepEP disables shared-expert fusion by default. On that main HCU
             # path no later operation can introduce another route, so remap and
@@ -2401,26 +2435,6 @@ def _post_process_topk_ids(
             # otherwise its dispatcher adds one copy kernel per MoE layer. Keep
             # the post-shared-expert mask below for the explicitly forced fused
             # shared-expert configuration.
-            if remap_info is not None and remap_info.ep_dispatch_algorithm == "lp":
-                # LP dispatch uses a separate HIP kernel. Resolve probabilities
-                # before entering the compiled padding/dtype postprocess.
-                from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-                solver = get_global_lplb_solver(layer_id)
-                if solver is None:
-                    raise RuntimeError(f"Missing HIP LPLB solver for layer {layer_id}")
-                probabilities = solver.solve(topk_ids)
-                if hasattr(solver, "static_dispatch_map"):
-                    from sglang.kernels.ops.lplb import cuda_solver
-
-                    topk_ids = cuda_solver.dispatch_probability(
-                        topk_ids, probabilities, solver.static_dispatch_map
-                    )
-                else:
-                    topk_ids = topk_ids_logical_to_physical(
-                        topk_ids, remap_info, probabilities
-                    )
-                remap_info = None  # IDs are physical; do not remap a second time.
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids,
                 remap_info,
