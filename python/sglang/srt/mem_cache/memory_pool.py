@@ -4900,11 +4900,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
                     self.page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
+            # BF16, INT8 and FP8 index-K storage all use physical page-64
+            # indexing, including when replicated draft KV uses virtual pages.
             assert self.index_page_size == 64
-            if self.index_page_size != self.page_size:
-                assert self.index_k_cache_mode in (
-                    IndexKCacheMode.BF16, IndexKCacheMode.INT8_SCALED
-                ), "Virtual DCP draft pages support BF16 or INT8 index-K storage"
         self.index_key_cache = self._create_index_key_cache()
         self._initialize_int8_index_k_workspace()
         self._finalize_allocation_log(size)
